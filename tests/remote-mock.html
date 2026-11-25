@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>서버 모드 모의 테스트</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css"
+    integrity="sha384-GIdEBaqGN9mNkDkMkzMHW8EKUqtpPIe/sLj1X7DIrnc9uPtLROJgmuDlh+3rBw0j" crossorigin="anonymous">
+  <link rel="stylesheet" href="../css/style.css">
+  <script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"
+    integrity="sha384-ieG+IKD0d/ZPXyCBTMVAbqsQdns8QGJR/e26WMw7M4fkaI/rHcS/YIoi+ah9WGge" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="toasts"></div>
+  <!-- 개발용: 실제 Supabase 대신 브라우저 안 Postgres(PGlite)에 같은 schema.sql 을 올려 서버 모드를 시험한다 -->
+  <script type="module">
+    import { PGlite } from 'https://cdn.jsdelivr.net/npm/@electric-sql/pglite@0.2.17/dist/index.js';
+    const db = new PGlite();
+    await db.exec(`
+      create role anon nologin; create role authenticated nologin;
+      create schema auth;
+      create table auth.users (id uuid primary key default gen_random_uuid(), email text, raw_user_meta_data jsonb default '{}', raw_app_meta_data jsonb default '{"provider":"google"}', email_confirmed_at timestamptz default now());
+create table auth.identities (id uuid primary key default gen_random_uuid(), user_id uuid, provider text);
+      create function auth.uid() returns uuid language sql stable as $$ select nullif(current_setting('test.uid', true), '')::uuid $$;
+      grant usage on schema auth to anon, authenticated; grant execute on function auth.uid() to anon, authenticated;`);
+    await db.exec(await (await fetch('../supabase/schema.sql')).text());
+    await db.exec(`update settings set domain = 'school.hs.kr', club_name = '모의 동아리';
+      update private_settings set teacher_emails = array['t@school.hs.kr'], whitelist = array['a@school.hs.kr', 'b@school.hs.kr'];`);
+    const users = {};
+    for (const [email, name] of [['t@school.hs.kr', '선생님'], ['a@school.hs.kr', '에이'], ['b@school.hs.kr', '비'], ['p@school.hs.kr', '대기']]) {
+      users[email] = (await db.query(`insert into auth.users (email, raw_user_meta_data) values ($1, $2) returning id`, [email, { full_name: name }])).rows[0].id;
+    }
+    let uid = null;
+    let queue = Promise.resolve();
+    // 한 연결에서 역할을 바꿔 가며 실행하므로 순서대로 처리
+    const run = (sql, params) => (queue = queue.then(async () => {
+      await db.exec('set role authenticated');
+      await db.query(`select set_config('test.uid', $1, false)`, [uid || '']);
+      try { return { data: (await db.query(sql, params)).rows, error: null }; }
+      catch (e) { return { data: null, error: { message: e.message } }; }
+      finally { await db.exec('reset role'); }
+    }));
+    function from(table) {
+      const st = { cols: '*', where: [], params: [], order: '', single: false, limit: '' };
+      const b = {
+        select(c) { st.cols = c; return b; },
+        eq(c, v) { st.params.push(v); st.where.push(`${c} = $${st.params.length}`); return b; },
+        in(c, vs) { st.params.push(vs); st.where.push(`${c}::text = any($${st.params.length}::text[])`); return b; },
+        order(c, o) { st.order = ` order by ${c} ${o?.ascending === false ? 'desc' : 'asc'}`; return b; },
+        range(a, z) { st.limit = ` offset ${a} limit ${z - a + 1}`; return b; },
+        single() { st.single = true; return b; },
+        then(res, rej) {
+          const sql = `select ${st.cols} from public.${table}${st.where.length ? ' where ' + st.where.join(' and ') : ''}${st.order}${st.limit}`;
+          return run(sql, st.params).then((r) => (st.single ? { data: r.data?.[0] ?? null, error: r.error || (r.data?.length ? null : { message: 'no rows' }) } : r)).then(res, rej);
+        },
+      };
+      return b;
+    }
+    async function rpc(name, params) {
+      const keys = Object.keys(params);
+      const vals = keys.map((k) => params[k]);
+      const args = keys.map((k, i) => {
+        const v = vals[i];
+        if (Array.isArray(v) && v.every((x) => typeof x === 'string')) return `${k} => $${i + 1}::text[]`;
+        if (v && typeof v === 'object') { vals[i] = JSON.stringify(v); return `${k} => $${i + 1}::jsonb`; }
+        if (typeof v === 'boolean') return `${k} => $${i + 1}::boolean`;
+        if (typeof v === 'number') return `${k} => $${i + 1}::int`;
+        return `${k} => $${i + 1}`;
+      }).join(', ');
+      const setFn = name === 'tree_skeleton';
+      const r = await run(setFn ? `select * from public.${name}(${args})` : `select public.${name}(${args}) as r`, vals);
+      if (r.error) return r;
+      return { data: setFn ? r.data : r.data[0].r, error: null };
+    }
+    const listeners = [];
+    window.supabase = {
+      createClient: () => ({
+        auth: {
+          getSession: async () => ({ data: { session: uid ? { user: { id: uid } } : null } }),
+          signOut: async () => { uid = null; listeners.forEach((f) => f('SIGNED_OUT')); },
+          onAuthStateChange: (f) => { listeners.push(f); },
+          signInWithOAuth: async () => ({ error: { message: '모의 환경: window.mockLogin(이메일) 을 쓰세요' } }),
+        },
+        from, rpc,
+      }),
+    };
+    window.mockLogin = async (email) => { uid = users[email]; await Remote.refresh(); render(); };
+    window.mockUsers = users;
+    window.mockDb = db;
+    window.APP_CONFIG = { supabaseUrl: 'mock', supabaseAnonKey: 'mock' };
+    for (const src of ['../js/util.js', '../js/seed.js', '../js/store.js', '../js/remote.js', '../js/app.js']) {
+      await new Promise((ok, no) => { const s = document.createElement('script'); s.src = src; s.onload = ok; s.onerror = no; document.body.appendChild(s); });
+    }
+    // 화면 확인용 예시 데이터 (이 테스트 페이지의 브라우저 안 DB에만 들어간다)
+    window.mockSeed = async () => {
+      const F = (main) => [{ path: 'README.md', content: '# 로켓 시뮬레이션\n\n수직으로 발사한 로켓의 고도와 속도를 계산합니다.\n\n## 실행 방법\n```\npython main.py\n```\n' }, { path: 'main.py', content: main }, { path: 'lib/util.py', content: 'def twice(x):\n    return x * 2\n' }];
+      await db.exec(`update profiles set generation = 3 where id = '${users['a@school.hs.kr']}'; update profiles set generation = 4 where id = '${users['b@school.hs.kr']}';`);
+      await window.mockLogin('a@school.hs.kr');
+      const r1 = await Api.createProject({ title: '로켓 시뮬레이션', description: '수직 발사 로켓의 고도와 속도를 계산하는 파이썬 시뮬레이션', permission: 'free', generation: 3, files: F('from lib.util import twice\n\nTHRUST = 15.0\nprint("로켓 발사!", twice(21))\n') });
+      await Api.createProject({ title: '급식 메뉴 추천기', description: '오늘 기분에 맞는 급식 조합을 추천합니다', permission: 'approval', generation: 3, files: F('import random\nprint(random.choice(["카레", "돈가스"]))\n') });
+      await window.mockLogin('b@school.hs.kr');
+      const f1 = await Api.forkProject(r1.id, { title: '공기저항 추가', description: '속도 제곱에 비례하는 공기저항을 넣었습니다' });
+      await Api.commitVersion(f1.id, F('from lib.util import twice\n\nTHRUST = 15.0\nK = 0.002  # 공기저항\nprint("공기저항", K, twice(21))\n'), '공기저항 항 추가');
+      await Api.createMergeRequest(f1.id, '공기저항을 넣으면 실제 로켓과 더 비슷해져요');
+      await Api.createProject({ title: '반응속도 테스트 게임', description: 'HTML/JS로 만든 반응속도 측정 게임', permission: 'view', generation: 4, files: [{ path: 'README.md', content: '# 게임' }, { path: 'index.html', content: '<h1 id=t>클릭!</h1><script src="game.js"><\/script>' }, { path: 'game.js', content: 'document.getElementById("t").onclick=()=>alert(1)' }] });
+      await window.mockLogin('t@school.hs.kr');
+      await Api.forkProject(f1.id, { title: '고도 그래프 개선', description: '고도 변화를 막대그래프로 보여줍니다' });
+      await window.mockLogin('a@school.hs.kr');
+      await Api.addComment(Api.rawProject(r1.id).headVersionId, 'main.py', 3, '추력 값을 설정 파일로 빼면 실험하기 편할 것 같아요');
+      await Api.resolveMergeRequest(Api.mergeRequestsTo(r1.id)[0].id, true, '');
+      return { r1: r1.id, f1: f1.id };
+    };
+    window.mockReady = true;
+  </script>
+</body>
+</html>
