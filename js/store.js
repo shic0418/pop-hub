@@ -55,7 +55,7 @@ const Api = (() => {
     return u;
   }
   function requireStaff() { const u = requireActive(); if (!isStaff(u)) fail('운영진 권한이 필요합니다.'); return u; }
-  function requireTeacher() { const u = requireActive(); if (!isTeacher(u)) fail('지도교사 권한이 필요합니다.'); return u; }
+  function requireTeacher() { const u = requireActive(); if (!isTeacher(u)) fail('부장 권한이 필요합니다.'); return u; }
 
   /* ---------- 알림 ---------- */
   function notify(userId, text, link) {
@@ -108,7 +108,7 @@ const Api = (() => {
     const cur = requireStaff(); const u = find('users', id) || fail('사용자가 없습니다.');
     if (!['active', 'graduated'].includes(status)) fail('잘못된 상태입니다.');
     if (u.id === cur.id) fail('자기 자신의 상태는 바꿀 수 없습니다.');
-    if (u.role === 'teacher' && !isTeacher(cur)) fail('지도교사 계정은 지도교사만 바꿀 수 있습니다.');
+    if (u.role === 'teacher' && !isTeacher(cur)) fail('부장 계정은 부장만 바꿀 수 있습니다.');
     u.status = status; Store.save();
   }
   function setUserRole(id, role) {
@@ -127,10 +127,10 @@ const Api = (() => {
   function updateSettings(patch) {
     const cur = requireStaff();
     const s = D().settings;
-    // 가입 보안의 핵심인 도메인·가입 방식은 지도교사만 바꾼다
+    // 가입 보안의 핵심인 도메인·가입 방식은 부장만 바꾼다
     const changing = (patch.domain != null && String(patch.domain).trim().toLowerCase().replace(/^@/, '') !== s.domain)
       || (patch.signupMode != null && patch.signupMode !== s.signupMode);
-    if (changing && !isTeacher(cur)) fail('학교 도메인과 가입 방식은 지도교사만 바꿀 수 있습니다.');
+    if (changing && !isTeacher(cur)) fail('학교 도메인과 가입 방식은 부장만 바꿀 수 있습니다.');
     if (patch.clubName != null) s.clubName = String(patch.clubName).trim() || s.clubName;
     if (patch.domain != null) {
       const d = String(patch.domain).trim().toLowerCase().replace(/^@/, '');
@@ -455,11 +455,11 @@ const Api = (() => {
     const u = requireStaff(); const r = find('reports', id) || fail('신고가 없습니다.');
     if (r.status === 'resolved') fail('이미 처리된 신고입니다.');
     if (action === 'escalate') {
-      if (isTeacher(u)) fail('지도교사는 바로 처리하세요.');
+      if (isTeacher(u)) fail('부장은 바로 처리하세요.');
       r.status = 'escalated';
       D().users.filter(isTeacher).forEach((t) => notify(t.id, '운영진이 신고 건의 최종 판단을 요청했습니다.', '#/admin?tab=reports'));
     } else if (action === 'hide' || action === 'dismiss') {
-      if (r.status === 'escalated' && !isTeacher(u)) fail('지도교사에게 넘긴 신고는 지도교사가 처리합니다.');
+      if (r.status === 'escalated' && !isTeacher(u)) fail('부장에게 넘긴 신고는 부장이 처리합니다.');
       if (action === 'hide') setHidden(r.projectId, true, false);
       r.status = 'resolved'; r.action = action; r.resolvedBy = u.id; r.resolvedAt = now();
     } else fail('잘못된 처리 방식');

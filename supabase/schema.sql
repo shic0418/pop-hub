@@ -25,7 +25,7 @@ insert into public.settings (id) values (1) on conflict do nothing;
 alter table public.settings drop constraint if exists settings_max_file_kb_check;
 alter table public.settings add constraint settings_max_file_kb_check check (max_file_kb between 1 and 10240);
 
--- 명단·지도교사 이메일은 운영진만 볼 수 있도록 따로 둔다
+-- 명단·부장 이메일은 운영진만 볼 수 있도록 따로 둔다
 create table if not exists public.private_settings (
   id              int primary key default 1 check (id = 1),
   whitelist       text[] not null default '{}',
@@ -217,7 +217,7 @@ language plpgsql stable security definer set search_path = public as $$
 declare u profiles;
 begin
   u := private.require_active();
-  if u.role <> 'teacher' then raise exception '지도교사 권한이 필요합니다.'; end if;
+  if u.role <> 'teacher' then raise exception '부장 권한이 필요합니다.'; end if;
   return u;
 end $$;
 -- 보이는 프로젝트를 가져오거나 오류
@@ -462,7 +462,7 @@ begin
   if p_status not in ('active', 'graduated') then raise exception '잘못된 상태입니다.'; end if;
   if t.status = 'pending' then raise exception '승인 대기 중인 사용자는 먼저 승인하세요.'; end if;
   if t.id = cur.id then raise exception '자기 자신의 상태는 바꿀 수 없습니다.'; end if;
-  if t.role = 'teacher' and cur.role <> 'teacher' then raise exception '지도교사 계정은 지도교사만 바꿀 수 있습니다.'; end if;
+  if t.role = 'teacher' and cur.role <> 'teacher' then raise exception '부장 계정은 부장만 바꿀 수 있습니다.'; end if;
   update profiles set status = p_status where id = p_id;
 end $$;
 
@@ -497,7 +497,7 @@ begin
   if nullif(trim(p_club_name), '') is not null then update settings set club_name = trim(p_club_name) where id = 1; end if;
   if (p_domain is not null and p_domain is distinct from (select domain from settings where id = 1))
      or (p_signup_mode is not null and p_signup_mode is distinct from (select signup_mode from settings where id = 1)) then
-    if not private.is_teacher() then raise exception '학교 도메인과 가입 방식은 지도교사만 바꿀 수 있습니다.'; end if;
+    if not private.is_teacher() then raise exception '학교 도메인과 가입 방식은 부장만 바꿀 수 있습니다.'; end if;
   end if;
   perform private.check_len(p_club_name, 40, '동아리 이름');
   if p_domain is not null then
@@ -811,13 +811,13 @@ begin
   if r.id is null then raise exception '신고가 없습니다.'; end if;
   if r.status = 'resolved' then raise exception '이미 처리된 신고입니다.'; end if;
   if p_action = 'escalate' then
-    if u.role = 'teacher' then raise exception '지도교사는 바로 처리하세요.'; end if;
+    if u.role = 'teacher' then raise exception '부장은 바로 처리하세요.'; end if;
     update reports set status = 'escalated' where id = p_id;
     for t in select id from profiles where role = 'teacher' and status = 'active' loop
       perform private.notify(t.id, '운영진이 신고 건의 최종 판단을 요청했습니다.', '#/admin?tab=reports');
     end loop;
   elsif p_action in ('hide', 'dismiss') then
-    if r.status = 'escalated' and u.role <> 'teacher' then raise exception '지도교사에게 넘긴 신고는 지도교사가 처리합니다.'; end if;
+    if r.status = 'escalated' and u.role <> 'teacher' then raise exception '부장에게 넘긴 신고는 부장이 처리합니다.'; end if;
     if p_action = 'hide' then update projects set hidden = true where id = r.project_id; end if;
     update reports set status = 'resolved', action = p_action, resolved_by = u.id, resolved_at = clock_timestamp() where id = p_id;
   else

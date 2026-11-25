@@ -18,7 +18,7 @@ function icon(name, size = 16) {
 }
 
 /* ---------- 공용 조각 ---------- */
-const ROLE_LABEL = { member: '부원', admin: '운영진', teacher: '지도교사' };
+const ROLE_LABEL = { member: '부원', admin: '운영진', teacher: '부장' };
 const STATUS_LABEL = { active: '활동', pending: '승인 대기', graduated: '졸업생' };
 const PERM_LABEL = { free: '수정 자유', approval: '승인 필요', view: '보기만 가능' };
 const PERM_DESC = { free: '누구나 수정본을 만들 수 있습니다', approval: '수정본을 만들려면 원작자 승인이 필요합니다', view: '보기와 다운로드만 가능합니다' };
@@ -1011,7 +1011,7 @@ function viewAdmin(q) {
   const tab = q.tab || 'pending';
   const openReports = reports.filter((r) => r.status !== 'resolved').length;
   const T = [['pending', '가입 승인', pending.length], ['users', '부원', users.length - pending.length], ['reports', '신고', openReports], ['hidden', '숨김 프로젝트', null], ['settings', '설정', null]];
-  const REPORT = { open: ['접수', 'badge-danger'], escalated: ['지도교사 판단 대기', 'badge-warn'], resolved: ['처리 완료', 'badge-muted'] };
+  const REPORT = { open: ['접수', 'badge-danger'], escalated: ['부장 판단 대기', 'badge-warn'], resolved: ['처리 완료', 'badge-muted'] };
   let body;
   if (tab === 'pending') {
     body = pending.length ? html`<div>${pending.map((x) => html`<div class="req">
@@ -1031,14 +1031,14 @@ function viewAdmin(q) {
           ? html`<button class="btn btn-sm btn-tertiary" data-act="setStatus" data-id="${x.id}" data-v="graduated">졸업 처리</button>`
           : html`<button class="btn btn-sm btn-tertiary" data-act="setStatus" data-id="${x.id}" data-v="active">활동으로 복귀</button>`) : ''}</td></tr>`)}
       </tbody></table></div>
-      <p class="faint xs" style="margin-top:12px">역할 변경은 지도교사만 할 수 있습니다. 졸업 처리해도 올린 프로젝트와 출처 표기는 그대로 남습니다.</p>`;
+      <p class="faint xs" style="margin-top:12px">역할 변경은 부장만 할 수 있습니다. 졸업 처리해도 올린 프로젝트와 출처 표기는 그대로 남습니다.</p>`;
   } else if (tab === 'reports') {
     body = reports.length ? html`<div>${reports.map((r) => html`<div class="req"><div class="req-main">
       <div class="req-line"><span class="badge ${REPORT[r.status][1]}">${REPORT[r.status][0]}</span>${projLink(Api.rawProject(r.projectId))}</div>
       <div class="req-msg">${r.reason}</div>
       <div class="meta" style="margin-top:6px"><span>신고자 ${Api.user(r.reporterId).name}</span><span>${timeAgo(r.createdAt)}</span>${r.action ? html`<span>결과: ${r.action === 'hide' ? '숨김' : '문제없음'}</span>` : ''}</div></div>
       ${r.status !== 'resolved' && (r.status === 'open' || Api.isTeacher(u)) ? html`<div class="row-end">
-        ${!Api.isTeacher(u) ? html`<button class="btn btn-sm btn-tertiary" data-act="report2" data-id="${r.id}" data-v="escalate">지도교사에게 넘기기</button>` : ''}
+        ${!Api.isTeacher(u) ? html`<button class="btn btn-sm btn-tertiary" data-act="report2" data-id="${r.id}" data-v="escalate">부장에게 넘기기</button>` : ''}
         <button class="btn btn-sm" data-act="report2" data-id="${r.id}" data-v="dismiss">문제없음</button>
         <button class="btn btn-sm btn-danger" data-act="report2" data-id="${r.id}" data-v="hide">${icon('EyeOff', 14)}숨김 처리</button></div>` : ''}</div>`)}</div>`
       : empty('접수된 신고가 없습니다');
@@ -1051,7 +1051,7 @@ function viewAdmin(q) {
     const teacher = Api.isTeacher(u);
     body = html`<form data-form="settings" class="stack narrow">
       <label class="field"><span>동아리 이름</span><input name="clubName" value="${s.clubName}" maxlength="40"></label>
-      <label class="field"><span>허용 학교 도메인</span><input name="domain" value="${s.domain}" ${teacher ? '' : raw('readonly')}><span class="hint">이 도메인의 Google 계정만 가입할 수 있습니다. 서버에서도 다시 검사합니다.${teacher ? '' : ' 지도교사만 바꿀 수 있습니다.'}</span></label>
+      <label class="field"><span>허용 학교 도메인</span><input name="domain" value="${s.domain}" ${teacher ? '' : raw('readonly')}><span class="hint">이 도메인의 Google 계정만 가입할 수 있습니다. 서버에서도 다시 검사합니다.${teacher ? '' : ' 부장만 바꿀 수 있습니다.'}</span></label>
       <fieldset ${teacher ? '' : raw('disabled')}><legend>가입 방식</legend><div class="choice-list">
         <label class="choice"><input type="radio" name="signupMode" value="approval" ${s.signupMode === 'approval' ? raw('checked') : ''}><div><b>운영진 승인</b><span>학교 계정으로 로그인하면 승인 대기 상태가 되고, 운영진이 승인합니다. 명단에 있는 이메일은 바로 가입됩니다.</span></div></label>
         <label class="choice"><input type="radio" name="signupMode" value="whitelist" ${s.signupMode === 'whitelist' ? raw('checked') : ''}><div><b>부원 명단만</b><span>아래 명단에 있는 이메일만 가입할 수 있습니다.</span></div></label>

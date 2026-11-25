@@ -46,7 +46,7 @@ const T = await signup('t@school.hs.kr', '선생님');
 const A = await signup('a@school.hs.kr', '에이');
 const B = await signup('b@school.hs.kr', '비');
 let r = await as(T, `select role, status from profiles where id = $1`, [T]);
-ok(r.rows[0].role === 'teacher' && r.rows[0].status === 'active', '지도교사 이메일 → teacher');
+ok(r.rows[0].role === 'teacher' && r.rows[0].status === 'active', '부장 이메일 → teacher');
 r = await as(A, `select status from profiles where id = $1`, [A]);
 ok(r.rows[0].status === 'active', '명단 이메일 → 바로 활동');
 r = await as(B, `select status from profiles where id = $1`, [B]);
@@ -66,9 +66,9 @@ ok(r.rows.length === 0, '비로그인은 명단 못 읽음');
 
 // 3. 승인·역할
 r = await as(A, `select set_user_role($1, 'teacher')`, [B]);
-ok(r.err?.includes('지도교사 권한'), '부원은 역할 변경 불가');
+ok(r.err?.includes('부장 권한'), '부원은 역할 변경 불가');
 r = await as(T, `select approve_user($1, 4)`, [B]);
-ok(!r.err, '지도교사가 승인');
+ok(!r.err, '부장이 승인');
 r = await as(T, `select approve_user($1, 4)`, [B]);
 ok(r.err?.includes('승인 대기 중인 사용자가 아닙니다'), '중복 승인 차단');
 r = await as(T, `select set_user_role($1, 'admin')`, [A]);
@@ -131,7 +131,7 @@ r = await as(A, `select update_project_info($1, null, null, 'view')`, [Q]);
 r = await as(A, `select resolve_fork_request($1, true)`, [FR]);
 ok(r.err?.includes('보기만'), '보기만으로 바뀐 뒤 승인 차단');
 await as(A, `select update_project_info($1, null, null, 'approval')`, [Q]);
-// 원작자가 졸업 → 운영진(지도교사)이 대신 처리
+// 원작자가 졸업 → 운영진(부장)이 대신 처리
 r = await as(T, `select set_user_status($1, 'graduated')`, [A]);
 ok(!r.err, '졸업 처리');
 r = await as(A, `select create_project('x', '', 'free', 1, $1::jsonb)`, [files()]);
@@ -170,9 +170,9 @@ r = await as(A, `select id from reports`);
 const RP = r.rows[0].id;
 r = await as(A, `select resolve_report($1, 'escalate')`, [RP]);
 r = await as(A, `select resolve_report($1, 'hide')`, [RP]);
-ok(r.err?.includes('지도교사'), '넘긴 신고는 지도교사만');
+ok(r.err?.includes('부장'), '넘긴 신고는 부장만');
 r = await as(T, `select resolve_report($1, 'hide')`, [RP]);
-ok(!r.err, '지도교사가 숨김 처리');
+ok(!r.err, '부장이 숨김 처리');
 r = await as(B, `select count(*)::int n from projects where id = $1`, [Q]);
 ok(r.rows[0].n === 0, '숨김 프로젝트는 부원에게 안 보임');
 r = await as(B, `select count(*)::int n from tree_skeleton() where id = $1`, [Q]);
@@ -229,11 +229,11 @@ await db.query(`update auth.users set raw_user_meta_data = '{"x":1}' where id = 
 ok(await prof('g@school.hs.kr') === 1, '이후 UPDATE 에도 중복 생성 없음');
 ok((await db.query(`insert into auth.users (email, raw_app_meta_data, email_confirmed_at) values ('h@other.kr', '{}', null)`).then(() => 'OK', (e) => e.message)).includes('학교 계정'), '확인 전이라도 다른 도메인은 즉시 차단');
 r = await as(A, `select update_settings(p_domain => 'gmail.com')`);
-ok(r.err?.includes('지도교사만'), '운영진(학생)은 도메인 변경 불가');
+ok(r.err?.includes('부장만'), '운영진(학생)은 도메인 변경 불가');
 r = await as(A, `select update_settings(p_domain => 'school.hs.kr', p_club_name => '새 이름')`);
 ok(!r.err, '도메인을 그대로 두고 다른 설정 저장은 가능');
 r = await as(T, `select update_settings(p_signup_mode => 'approval')`);
-ok(!r.err, '지도교사는 가입 방식 변경 가능');
+ok(!r.err, '부장은 가입 방식 변경 가능');
 const FV = (await as(B, `select head_version_id id from projects where id = $1`, [F])).rows[0].id;
 r = await as(B, `select add_comment($1, 'main.py', 1, $2)`, [FV, 'x'.repeat(2001)]);
 ok(r.err?.includes('2000자'), '댓글 길이 제한');
@@ -243,7 +243,7 @@ ok(r.err?.includes('이미 신고'), '중복 신고 차단');
 await db.exec(`update private_settings set teacher_emails = array['Big@School.hs.kr'], whitelist = '{}'`);
 const BIG = await signup('big@school.hs.kr', '대문자');
 r = await as(BIG, `select role from profiles where id = $1`, [BIG]);
-ok(r.rows[0]?.role === 'teacher', '대소문자 섞인 지도교사 이메일도 인식');
+ok(r.rows[0]?.role === 'teacher', '대소문자 섞인 부장 이메일도 인식');
 
 // 13. 용량 한도 (파일당 기본 2MB·최대 10MB 설정, 프로젝트 전체 10MB)
 const big = (kb) => 'x'.repeat(kb * 1024);
