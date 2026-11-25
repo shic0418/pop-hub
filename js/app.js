@@ -168,8 +168,8 @@ function layout(u, body, section) {
   ${u.status === 'graduated' ? html`<div class="banner">${icon('Info', 15)}졸업생 계정입니다. 올린 프로젝트는 그대로 남아 있으며, 읽기만 가능합니다.</div>` : ''}
   <main id="main" tabindex="-1" class="container ${section === 'p' ? 'wide' : ''}">${body}</main>
   ${Remote.enabled
-    ? html`<footer class="foot"><span class="status-dot" aria-hidden="true"></span>서버에 연결됨<span class="dot-sep"></span><button data-act="reloadData">새로 불러오기</button></footer>`
-    : html`<footer class="foot">데모 모드 · 데이터는 이 브라우저에만 저장됩니다<span class="dot-sep"></span><button data-act="resetDemo">데모 데이터 초기화</button></footer>`}`;
+    ? html`<footer class="foot"><span class="status-dot" aria-hidden="true"></span>서버에 연결됨<span class="dot-sep"></span><button data-act="reloadData">새로 불러오기</button><span class="dot-sep"></span><a href="privacy.html">개인정보처리방침</a></footer>`
+    : html`<footer class="foot">데모 모드 · 데이터는 이 브라우저에만 저장됩니다<span class="dot-sep"></span><button data-act="resetDemo">데모 데이터 초기화</button><span class="dot-sep"></span><a href="privacy.html">개인정보처리방침</a></footer>`}`;
 }
 /** 페이지 머리: 설명은 꼭 필요한 화면에만. 개수는 제목 옆에 작게 붙인다 */
 function pageHeader(title, desc = '', actions = '', count = null) {
@@ -182,7 +182,8 @@ const GOOGLE_G = raw('<svg width="18" height="18" viewBox="0 0 48 48" aria-hidde
 function viewLogin() {
   const s = Api.settings();
   const foot = html`<p class="auth-foot"><b>@${s.domain}</b> 계정만 가입할 수 있습니다.
-    ${s.signupMode === 'approval' ? '처음 로그인하면 운영진 승인 후 이용할 수 있습니다.' : '운영진이 등록한 부원 명단에 있어야 가입할 수 있습니다.'}</p>`;
+    ${s.signupMode === 'approval' ? '처음 로그인하면 운영진 승인 후 이용할 수 있습니다.' : '운영진이 등록한 부원 명단에 있어야 가입할 수 있습니다.'}
+    <br><a class="link" href="privacy.html">개인정보처리방침</a></p>`;
   if (Remote.enabled) {
     return html`<div class="auth">
       <div class="auth-brand">${brand(s.clubName)}</div>
