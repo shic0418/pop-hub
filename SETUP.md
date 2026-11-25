@@ -78,6 +78,12 @@ window.APP_CONFIG = {
   - 예: GitHub Pages, Cloudflare Pages, Netlify, Vercel
 - 배포한 주소는 2-6단계의 **Site URL / Redirect URLs**에도 넣어야 합니다.
 
+## 현재 배포 상태 (POP-Hub)
+- 사이트 주소: https://shic0418.github.io/pop-hub/ (GitHub 저장소 `shic0418/pop-hub`의 `main` 브랜치를 GitHub Pages로 배포)
+- 코드를 고친 뒤 `git push` 하면 1~2분 뒤 자동으로 반영됩니다. 화면이 예전 그대로면 Ctrl+Shift+R로 새로고침하세요.
+- Supabase **Site URL**: 위 사이트 주소 / **Redirect URLs**: 사이트 주소와 `http://localhost:5173/**`
+- Google 로그인 앱: **프로덕션(게시됨)** 상태. 홈페이지·개인정보처리방침(`privacy.html`)·승인된 도메인(`shic0418.github.io`) 등록됨
+
 ## 5. 알아 둘 점
 - **코드 저장 위치**: 코드 파일은 DB의 `versions.files`(JSON)에 저장합니다. 기획서의 Supabase Storage 대신입니다.
   - 파일당 용량 제한(기본 2MB, 관리 화면에서 최대 10MB까지)과 프로젝트당 10MB 제한이 있습니다.
