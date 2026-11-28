@@ -4,7 +4,42 @@
  * Api 객체는 "서버" 역할을 흉내 내며, 모든 권한 검사를 여기서 다시 한다.
  * 나중에 Supabase로 옮길 때는 Api 함수의 내부만 바꾸면 화면 코드는 그대로 쓸 수 있다.
  */
-const SCHEMA = 1;
+const SCHEMA = 2;
+/** 직책 정의 (서버 schema.sql 의 roles 표와 같은 값). 부원은 직책이 하나도 없는 상태 */
+const ROLE_DEFS = [
+  { code: 'owner', label: '최고 관리자' }, { code: 'admin', label: '관리자' }, { code: 'president', label: '부장' },
+  { code: 'vice', label: '차장' }, { code: 'server', label: '서버 관리자' },
+];
+/** 위임·세부 권한 목록 (서버 role_permissions 의 허용 목록과 같음) */
+const PERM_ALLOWED = { server: ['server.detail', 'server.backup', 'server.errors'], president: ['accounts.link'], vice: ['accounts.link'] };
+const PERM_NAME = { 'server.detail': '서버·DB 상세 상태 보기', 'server.backup': '백업 상태 보기', 'server.errors': '최근 오류 기록 보기', 'accounts.link': '계정 연결·병합 처리' };
+/** 운영 연도: N년 3월 1일 ~ N+1년 2월 말일 (한국 시간). 서버 private.year_of 와 같은 규칙 */
+function operatingYear(ts = Date.now()) {
+  const k = new Date(new Date(ts).getTime() + 9 * 3600 * 1000);
+  return k.getUTCMonth() >= 2 ? k.getUTCFullYear() : k.getUTCFullYear() - 1;
+}
+const yearBounds = (y) => ({ startsOn: `${y}-03-01`, endsOn: new Date(Date.UTC(y + 1, 2, 0)).toISOString().slice(0, 10) });
+/** 새로 추가된 표들을 빈 상태로 채운다 */
+function ensureV2Tables(db) {
+  for (const k of ['accounts', 'invites', 'rolePerms', 'ownerTransfers', 'auditLogs', 'years', 'sessions', 'membership', 'projectSessions']) if (!Array.isArray(db[k])) db[k] = [];
+  if (!db.rolePerms.length) {
+    for (const [role, perms] of Object.entries(PERM_ALLOWED)) perms.forEach((perm) => db.rolePerms.push({ role, perm, enabled: role === 'server' }));
+  }
+  return db;
+}
+/** 예전(v1) 브라우저 데이터를 지우지 않고 새 구조로 옮긴다: teacher → 최고 관리자+관리자, admin → 차장 */
+function migrateV1(db) {
+  [...db.users].sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt))).forEach((u, i) => {
+    u.roles = u.role === 'teacher' ? ['owner', 'admin'] : u.role === 'admin' ? ['vice'] : [];
+    u.role = 'member';
+    u.memberNo = 'POP-' + String(i + 1).padStart(4, '0');
+  });
+  db.projects.forEach((p) => { p.year = operatingYear(new Date(p.createdAt).getTime()); });
+  db.accounts = db.users.map((u) => ({ authId: 'au_' + u.id, memberId: u.id, email: u.email, status: 'active', linkedAt: u.createdAt }));
+  ensureV2Tables(db);
+  db.schema = 2;
+  return db;
+}
 /** 프로젝트 하나의 전체 크기 한도 (서버 schema.sql 의 validate_files 와 같은 값) */
 const PROJECT_LIMIT = 10 * 1024 * 1024;
 const STORE_KEY = 'clubrepo.db.v1';
@@ -13,7 +48,10 @@ const Store = (() => {
   let db = null;
   function load() {
     try { db = JSON.parse(localStorage.getItem(STORE_KEY)); } catch { db = null; }
+    if (db && db.schema === 1) { try { db = migrateV1(db); save(); } catch { db = null; } }
     if (!db || db.schema !== SCHEMA) { db = makeSeed(); save(); }
+    ensureV2Tables(db);
+    try { Api.ensureAcademicYear(); } catch (e) { console.warn('운영 연도 준비 실패', e); }   // 현재 운영 연도·차시를 만든다 (몇 번 불러도 같은 결과)
     return db;
   }
   function save() {
@@ -40,8 +78,18 @@ const Api = (() => {
 
   /* ---------- 세션·권한 ---------- */
   function me() { const id = D().session.userId; return id ? find('users', id) || null : null; }
-  const isStaff = (u) => !!u && u.status === 'active' && (u.role === 'admin' || u.role === 'teacher');
-  const isTeacher = (u) => !!u && u.status === 'active' && u.role === 'teacher';
+  // 직책은 여러 개를 함께 가질 수 있고 권한은 합산된다 (서버 private.has_role / is_admin / is_staff 와 같은 규칙)
+  const hasRole = (u, code) => !!u && u.status === 'active' && Array.isArray(u.roles) && u.roles.includes(code);
+  const isOwner = (u) => hasRole(u, 'owner');
+  const isAdmin = (u) => hasRole(u, 'owner') || hasRole(u, 'admin');
+  const isStaff = (u) => ['owner', 'admin', 'president', 'vice'].some((c) => hasRole(u, c));
+  const hasPerm = (u, perm) => isAdmin(u) || (!!u && u.status === 'active' && (u.roles || []).some((r) => (D().rolePerms || []).some((p) => p.role === r && p.perm === perm && p.enabled)));
+  const roleLabel = (code) => (ROLE_DEFS.find((r) => r.code === code) || { label: code }).label;
+  function audit(action, target, detail) {
+    const cur = me();
+    D().auditLogs.push({ id: uid('a'), at: now(), actor: cur ? cur.id : null, action, target: target || null, detail: detail || {} });
+  }
+  const isLastAdmin = (id) => isAdmin(find('users', id)) && !D().users.some((x) => x.id !== id && isAdmin(x));
   function requireReader() {
     const u = me();
     if (!u) fail('로그인이 필요합니다.');
@@ -55,7 +103,8 @@ const Api = (() => {
     return u;
   }
   function requireStaff() { const u = requireActive(); if (!isStaff(u)) fail('운영진 권한이 필요합니다.'); return u; }
-  function requireTeacher() { const u = requireActive(); if (!isTeacher(u)) fail('부장 권한이 필요합니다.'); return u; }
+  function requireAdmin() { const u = requireActive(); if (!isAdmin(u)) fail('관리자 권한이 필요합니다.'); return u; }
+  function requireAccountManager() { const u = requireActive(); if (!hasPerm(u, 'accounts.link')) fail('계정 연결 권한이 필요합니다.'); return u; }
 
   /* ---------- 알림 ---------- */
   function notify(userId, text, link) {
@@ -73,49 +122,73 @@ const Api = (() => {
     const domain = D().settings.domain.toLowerCase();
     // 서버 측 도메인 재검사 (클라이언트 검사를 믿지 않음)
     if (!email.endsWith('@' + domain)) fail(`학교 계정(@${domain})으로만 로그인할 수 있습니다.`);
-    let u = D().users.find((x) => x.email === email);
+    const acc = D().accounts.find((a) => a.email === email && a.status === 'active');
+    let u = acc ? find('users', acc.memberId) : null;
     if (!u) {
-      name = String(name || '').trim();
-      if (!name) fail('처음 로그인할 때는 이름을 입력해 주세요.');
-      const listed = D().settings.whitelist.map((e) => e.toLowerCase()).includes(email);
-      if (D().settings.signupMode === 'whitelist' && !listed) fail('부원 명단에 없는 계정입니다. 운영진에게 등록을 요청하세요.');
-      u = { id: uid('u'), email, name, role: 'member', status: listed ? 'active' : 'pending', generation: null, createdAt: now() };
-      D().users.push(u);
-      if (u.status === 'pending') notifyStaff(`${name}(${email}) 님이 가입 승인을 기다립니다.`, '#/admin?tab=pending');
+      const inv = D().invites.find((i) => i.email === email);
+      if (inv) {
+        // 사전 등록된 이메일: 새 회원을 만들지 않고 기존 회원에 연결 (이름이 같다는 이유로는 합치지 않는다)
+        u = find('users', inv.memberId);
+        D().accounts.push({ authId: uid('au'), memberId: u.id, email, status: 'active', linkedAt: now(), linkedBy: inv.createdBy });
+        D().invites = D().invites.filter((i) => i !== inv);
+        D().auditLogs.push({ id: uid('a'), at: now(), actor: null, action: 'account.linked', target: u.id, detail: { email, via: 'invite' } });
+      } else {
+        name = String(name || '').trim();
+        if (!name) fail('처음 로그인할 때는 이름을 입력해 주세요.');
+        const listed = D().settings.whitelist.map((e) => e.toLowerCase()).includes(email);
+        if (D().settings.signupMode === 'whitelist' && !listed) fail('부원 명단에 없는 계정입니다. 운영진에게 등록을 요청하세요.');
+        const no = 'POP-' + String(D().users.length + 1).padStart(4, '0');
+        u = { id: uid('u'), email, name, role: 'member', roles: [], memberNo: no, status: listed ? 'active' : 'pending', generation: null, createdAt: now() };
+        D().users.push(u);
+        D().accounts.push({ authId: uid('au'), memberId: u.id, email, status: 'active', linkedAt: now() });
+        if (u.status === 'active') touchMembership(u);
+        if (u.status === 'pending') notifyStaff(`${name}(${email}) 님이 가입 승인을 기다립니다.`, '#/admin?tab=pending');
+      }
     }
     D().session.userId = u.id;
     Store.save();
     return u;
   }
+  /** 현재 운영 연도 명단에 회원 한 명을 넣는다 (이미 있으면 그대로) */
+  function touchMembership(u) {
+    const cur = (D().years || []).find((y) => y.status === 'current');
+    if (!cur || D().membership.some((m) => m.memberId === u.id && m.year === cur.year)) return;
+    D().membership.push({ memberId: u.id, year: cur.year, generation: u.generation ?? null, grade: null, roles: [...(u.roles || [])], status: 'active' });
+  }
   function logout() { D().session.userId = null; Store.save(); }
 
   /* ---------- 사용자 ---------- */
-  function user(id) { return find('users', id) || { id, name: '(알 수 없음)', role: 'member', status: 'deleted' }; }
+  function user(id) { return find('users', id) || { id, name: '(알 수 없음)', role: 'member', roles: [], status: 'deleted' }; }
   function listUsers() { requireStaff(); return [...D().users].sort((a, b) => a.name.localeCompare(b.name)); }
   function approveUser(id, generation) {
     requireStaff(); const u = find('users', id) || fail('사용자가 없습니다.');
     if (u.status !== 'pending') fail('승인 대기 중인 사용자가 아닙니다.');
     u.status = 'active'; if (generation) u.generation = Number(generation);
+    touchMembership(u);
+    audit('member.approved', u.id, { generation: generation ? Number(generation) : null });
     notify(u.id, '가입이 승인되었습니다. 환영합니다!', '#/');
     Store.save();
   }
   function rejectUser(id) {
     requireStaff(); const u = find('users', id) || fail('사용자가 없습니다.');
     if (u.status !== 'pending') fail('승인 대기 중인 사용자만 거절할 수 있습니다.');
-    D().users = D().users.filter((x) => x.id !== id); Store.save();
+    audit('member.rejected', null, { member: id, member_no: u.memberNo, name: u.name });
+    D().users = D().users.filter((x) => x.id !== id);
+    D().accounts = D().accounts.filter((a) => a.memberId !== id);
+    Store.save();
   }
   function setUserStatus(id, status) {
     const cur = requireStaff(); const u = find('users', id) || fail('사용자가 없습니다.');
     if (!['active', 'graduated'].includes(status)) fail('잘못된 상태입니다.');
+    if (u.status === 'pending') fail('승인 대기 중인 사용자는 먼저 승인하세요.');
     if (u.id === cur.id) fail('자기 자신의 상태는 바꿀 수 없습니다.');
-    if (u.role === 'teacher' && !isTeacher(cur)) fail('부장 계정은 부장만 바꿀 수 있습니다.');
-    u.status = status; Store.save();
-  }
-  function setUserRole(id, role) {
-    const cur = requireTeacher(); const u = find('users', id) || fail('사용자가 없습니다.');
-    if (!['member', 'admin', 'teacher'].includes(role)) fail('잘못된 역할입니다.');
-    if (u.id === cur.id) fail('자기 자신의 역할은 바꿀 수 없습니다.');
-    u.role = role; Store.save();
+    if (status === 'graduated' && isLastAdmin(id)) fail('마지막 관리자는 졸업 처리할 수 없습니다.');
+    if ((u.roles || []).some((r) => r === 'owner' || r === 'admin') && !isAdmin(cur)) fail('관리자 계정은 관리자만 바꿀 수 있습니다.');
+    const from = u.status;
+    u.status = status;
+    if (status === 'active') touchMembership(u);
+    audit('member.status', u.id, { from, to: status });
+    Store.save();
   }
   function setUserGeneration(id, gen) {
     requireStaff(); const u = find('users', id) || fail('사용자가 없습니다.');
@@ -127,10 +200,10 @@ const Api = (() => {
   function updateSettings(patch) {
     const cur = requireStaff();
     const s = D().settings;
-    // 가입 보안의 핵심인 도메인·가입 방식은 부장만 바꾼다
+    // 가입 보안의 핵심인 도메인·가입 방식은 관리자만 바꾼다
     const changing = (patch.domain != null && String(patch.domain).trim().toLowerCase().replace(/^@/, '') !== s.domain)
       || (patch.signupMode != null && patch.signupMode !== s.signupMode);
-    if (changing && !isTeacher(cur)) fail('학교 도메인과 가입 방식은 부장만 바꿀 수 있습니다.');
+    if (changing && !isAdmin(cur)) fail('학교 도메인과 가입 방식은 관리자만 바꿀 수 있습니다.');
     if (patch.clubName != null) s.clubName = String(patch.clubName).trim() || s.clubName;
     if (patch.domain != null) {
       const d = String(patch.domain).trim().toLowerCase().replace(/^@/, '');
@@ -140,6 +213,7 @@ const Api = (() => {
     if (patch.signupMode != null) { if (!['approval', 'whitelist'].includes(patch.signupMode)) fail('잘못된 가입 방식'); s.signupMode = patch.signupMode; }
     if (patch.maxFileKB != null) { const n = Number(patch.maxFileKB); if (!(n >= 1 && n <= 10240)) fail('파일 용량 제한은 1~10240KB(10MB) 사이로 정하세요.'); s.maxFileKB = n; }
     if (patch.whitelist != null) s.whitelist = patch.whitelist.map((e) => e.trim().toLowerCase()).filter(Boolean);
+    audit('settings.updated', null, Object.fromEntries(Object.entries({ club_name: patch.clubName, domain: patch.domain, signup_mode: patch.signupMode, max_file_kb: patch.maxFileKB, whitelist_count: patch.whitelist ? patch.whitelist.length : null }).filter(([, v]) => v != null && v !== '')));
     Store.save();
   }
 
@@ -238,7 +312,7 @@ const Api = (() => {
     validateFiles(files);
     const t = now();
     const p = { id: uid('p'), title, description: String(description || '').trim(), ownerId: u.id, parentId: null, rootId: null,
-      permission, generation: generation ? Number(generation) : u.generation, createdAt: t, updatedAt: t, deleted: false, hidden: false, headVersionId: null };
+      permission, generation: generation ? Number(generation) : u.generation, year: operatingYear(), createdAt: t, updatedAt: t, deleted: false, hidden: false, headVersionId: null };
     p.rootId = p.id;
     D().projects.push(p);
     addVersion(p, u.id, files, String(message || '').trim() || '처음 업로드');
@@ -287,7 +361,7 @@ const Api = (() => {
   function doFork(src, owner, title, description) {
     const t = now();
     const p = { id: uid('p'), title: String(title || '').trim() || `${src.title} 수정본`, description: String(description || '').trim(),
-      ownerId: owner.id, parentId: src.id, rootId: src.rootId, permission: 'free', generation: owner.generation,
+      ownerId: owner.id, parentId: src.id, rootId: src.rootId, permission: 'free', generation: owner.generation, year: operatingYear(),
       createdAt: t, updatedAt: t, deleted: false, hidden: false, headVersionId: null };
     D().projects.push(p);
     const head = find('versions', src.headVersionId);
@@ -352,6 +426,7 @@ const Api = (() => {
     if (p.ownerId !== u.id && !isStaff(u)) fail('작성자 또는 운영진만 삭제할 수 있습니다.');
     if (p.deleted) fail('이미 삭제된 프로젝트입니다.');
     p.deleted = true; p.deletedAt = now(); p.deletedBy = u.id;
+    if (p.ownerId !== u.id) audit('project.deleted', p.ownerId, { project: id, title: p.title });
     D().mergeRequests.filter((m) => m.status === 'pending' && (m.fromProjectId === id || m.toProjectId === id)).forEach((m) => { m.status = 'closed'; });
     D().forkRequests.filter((r) => r.status === 'pending' && r.projectId === id).forEach((r) => { r.status = 'closed'; });
     childrenOf(id).forEach((c) => notify(c.ownerId, `「${c.title}」의 원본 「${p.title}」이 삭제되었습니다. 내 수정본은 그대로 남습니다.`, `#/p/${c.id}`));
@@ -361,6 +436,7 @@ const Api = (() => {
     requireStaff(); const p = rawProject(id) || fail('프로젝트가 없습니다.');
     const targets = [p, ...(withDescendants ? descendants(id) : [])];
     targets.forEach((x) => { x.hidden = !!hidden; });
+    audit(hidden ? 'project.hidden' : 'project.unhidden', p.ownerId, { project: id, count: targets.length, with_descendants: !!withDescendants });
     Store.save();
     return targets.length;
   }
@@ -455,13 +531,14 @@ const Api = (() => {
     const u = requireStaff(); const r = find('reports', id) || fail('신고가 없습니다.');
     if (r.status === 'resolved') fail('이미 처리된 신고입니다.');
     if (action === 'escalate') {
-      if (isTeacher(u)) fail('부장은 바로 처리하세요.');
+      if (isAdmin(u)) fail('관리자는 바로 처리하세요.');
       r.status = 'escalated';
-      D().users.filter(isTeacher).forEach((t) => notify(t.id, '운영진이 신고 건의 최종 판단을 요청했습니다.', '#/admin?tab=reports'));
+      D().users.filter(isAdmin).forEach((t) => notify(t.id, '운영진이 신고 건의 최종 판단을 요청했습니다.', '#/admin?tab=reports'));
     } else if (action === 'hide' || action === 'dismiss') {
-      if (r.status === 'escalated' && !isTeacher(u)) fail('부장에게 넘긴 신고는 부장이 처리합니다.');
+      if (r.status === 'escalated' && !isAdmin(u)) fail('관리자에게 넘긴 신고는 관리자가 처리합니다.');
       if (action === 'hide') setHidden(r.projectId, true, false);
       r.status = 'resolved'; r.action = action; r.resolvedBy = u.id; r.resolvedAt = now();
+      audit('report.resolved', null, { report: id, project: r.projectId, action });
     } else fail('잘못된 처리 방식');
     Store.save();
   }
@@ -510,13 +587,262 @@ const Api = (() => {
     return ev.sort((a, b) => b.at.localeCompare(a.at)).slice(0, limit);
   }
 
+  /* ---------- 직책 (복수 보유) ---------- */
+  const SINGLE_HOLDER = ['president', 'vice'];
+  function holdersOf(code) { return D().users.filter((x) => (x.roles || []).includes(code) && x.status === 'active'); }
+  /** 직책 임명. 부장·차장은 한 명(새 보유자를 정하면 기존 보유자는 자동으로 물러남), 관리자·서버 관리자는 여러 명 */
+  function appointRole(id, role) {
+    const cur = requireActive();
+    if (role === 'owner') fail('최고 관리자는 [최고 관리자 이양]으로만 바꿀 수 있습니다.');
+    if (!['admin', 'president', 'vice', 'server'].includes(role)) fail('임명할 수 없는 직책입니다.');
+    if (role === 'admin') { if (!isOwner(cur)) fail('관리자 임명은 최고 관리자만 할 수 있습니다.'); }
+    else if (!isAdmin(cur)) fail('관리자 권한이 필요합니다.');
+    const t = find('users', id) || fail('회원이 없습니다.');
+    if (t.status !== 'active') fail('활동 중인 회원에게만 직책을 줄 수 있습니다.');
+    if (t.roles.includes(role)) fail(`이미 ${roleLabel(role)} 직책을 가진 회원입니다.`);
+    if (SINGLE_HOLDER.includes(role)) {
+      D().users.filter((x) => x.roles.includes(role)).forEach((x) => {
+        x.roles = x.roles.filter((r) => r !== role);
+        audit('role.revoked', x.id, { role, reason: 'transfer', new_holder: id });
+        notify(x.id, `${roleLabel(role)} 직책이 ${t.name} 님에게 넘어갔습니다.`, '#/me');
+      });
+    }
+    t.roles.push(role);
+    audit('role.appointed', id, { role });
+    notify(id, `${roleLabel(role)} 직책이 부여되었습니다.`, '#/me');
+    Store.save();
+  }
+  function revokeRole(id, role) {
+    requireActive(); const cur = me();
+    if (role === 'owner') fail('최고 관리자는 [최고 관리자 이양]으로만 바꿀 수 있습니다.');
+    if (!['admin', 'president', 'vice', 'server'].includes(role)) fail('해임할 수 없는 직책입니다.');
+    if (role === 'admin') { if (!isOwner(cur)) fail('관리자 해임은 최고 관리자만 할 수 있습니다.'); }
+    else if (!isAdmin(cur)) fail('관리자 권한이 필요합니다.');
+    const t = find('users', id) || fail('회원이 없습니다.');
+    if (!t.roles.includes(role)) fail('그 직책을 가진 회원이 아닙니다.');
+    if (role === 'admin' && !D().users.some((x) => x.status === 'active' && (x.roles.includes('owner') || (x.roles.includes('admin') && x.id !== id)))) fail('마지막 관리자는 해임할 수 없습니다.');
+    t.roles = t.roles.filter((r) => r !== role);
+    audit('role.revoked', id, { role, reason: 'revoke' });
+    notify(id, `${roleLabel(role)} 직책이 해임되었습니다.`, '#/me');
+    Store.save();
+  }
+  function ownerTransfers() {
+    requireReader(); const u = me();
+    return D().ownerTransfers.filter((t) => isAdmin(u) || t.fromMember === u.id || t.toMember === u.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+  function proposeOwnerTransfer(id) {
+    const cur = requireActive();
+    if (!isOwner(cur)) fail('최고 관리자만 이양을 제안할 수 있습니다.');
+    const t = find('users', id) || fail('회원이 없습니다.');
+    if (t.id === cur.id) fail('자기 자신에게는 이양할 수 없습니다.');
+    if (t.status !== 'active') fail('활동 중인 회원에게만 이양할 수 있습니다.');
+    if (D().ownerTransfers.some((x) => x.fromMember === cur.id && x.status === 'pending')) fail('이미 진행 중인 이양 제안이 있습니다. 먼저 취소하세요.');
+    const tr = { id: uid('ot'), fromMember: cur.id, toMember: id, status: 'pending', createdAt: now(), decidedAt: null };
+    D().ownerTransfers.push(tr);
+    audit('owner.transfer_proposed', id, { transfer: tr.id });
+    notify(id, `${cur.name} 님이 최고 관리자 이양을 제안했습니다. 수락하면 최고 관리자가 됩니다.`, '#/admin?tab=roles');
+    Store.save();
+    return tr.id;
+  }
+  function acceptOwnerTransfer(id) {
+    const cur = requireActive();
+    const tr = find('ownerTransfers', id) || fail('이양 제안이 없습니다.');
+    if (tr.status !== 'pending') fail('이미 처리된 제안입니다.');
+    if (tr.toMember !== cur.id) fail('제안을 받은 본인만 수락할 수 있습니다.');
+    const from = find('users', tr.fromMember);
+    if (!from || !from.roles.includes('owner')) fail('제안한 사람이 더 이상 최고 관리자가 아닙니다.');
+    ['owner', 'admin'].forEach((r) => { if (!cur.roles.includes(r)) cur.roles.push(r); });
+    from.roles = from.roles.filter((r) => r !== 'owner');
+    if (!from.roles.includes('admin')) from.roles.push('admin');   // 이전 최고 관리자는 관리자로 남는다
+    tr.status = 'accepted'; tr.decidedAt = now();
+    audit('owner.transferred', cur.id, { transfer: id, from: from.id });
+    notify(from.id, `${cur.name} 님이 최고 관리자 이양을 수락했습니다. 이제 관리자입니다.`, '#/admin?tab=roles');
+    Store.save();
+  }
+  function cancelOwnerTransfer(id) {
+    const cur = requireActive();
+    const tr = find('ownerTransfers', id) || fail('이양 제안이 없습니다.');
+    if (tr.status !== 'pending') fail('이미 처리된 제안입니다.');
+    if (cur.id !== tr.fromMember && cur.id !== tr.toMember) fail('제안한 사람 또는 받은 사람만 취소할 수 있습니다.');
+    tr.status = 'cancelled'; tr.decidedAt = now();
+    audit('owner.transfer_cancelled', tr.toMember, { transfer: id });
+    notify(cur.id === tr.fromMember ? tr.toMember : tr.fromMember, `${cur.name} 님이 최고 관리자 이양 제안을 취소했습니다.`, '#/admin?tab=roles');
+    Store.save();
+  }
+  function setRolePermission(role, perm, enabled) {
+    requireAdmin();
+    const row = D().rolePerms.find((p) => p.role === role && p.perm === perm);
+    if (!row || !(PERM_ALLOWED[role] || []).includes(perm)) fail('설정할 수 없는 권한입니다.');
+    row.enabled = !!enabled;
+    audit('role.permission', null, { role, perm, enabled: !!enabled });
+    D().users.filter((x) => x.roles.includes(role)).forEach((x) => notify(x.id, `${roleLabel(role)} 직책의 권한이 바뀌었습니다.`, '#/me'));
+    Store.save();
+  }
+  function rolePermissions() { requireReader(); return D().rolePerms; }
+  function auditLogs() { requireAdmin(); return [...D().auditLogs].sort((a, b) => b.at.localeCompare(a.at)).slice(0, 200); }
+
+  /* ---------- 계정 연결 ---------- */
+  function accountsOf(memberId) { requireReader(); const u = me(); return D().accounts.filter((a) => a.memberId === memberId && (a.memberId === u.id || hasPerm(u, 'accounts.link'))); }
+  function listAccounts() { requireAccountManager(); return D().accounts; }
+  function listInvites() { requireAccountManager(); return D().invites; }
+  function inviteAccount(memberId, email) {
+    const cur = requireAccountManager();
+    const em = String(email || '').trim().toLowerCase();
+    const t = find('users', memberId) || fail('회원이 없습니다.');
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em)) fail('올바른 이메일 형식이 아닙니다.');
+    const domain = D().settings.domain.toLowerCase();
+    if (!em.endsWith('@' + domain)) fail(`학교 계정(@${domain})만 등록할 수 있습니다.`);
+    if (D().accounts.some((a) => a.email === em && a.status === 'active')) fail('이미 가입된 계정입니다. 승인 대기 회원이면 [기존 회원에 연결]을 쓰세요.');
+    const old = D().invites.find((i) => i.email === em);
+    if (old && old.memberId !== memberId) fail('이미 다른 회원에게 사전 등록된 이메일입니다.');
+    if (!old) D().invites.push({ email: em, memberId: t.id, createdBy: cur.id, createdAt: now() });
+    audit('account.invited', t.id, { email: em });
+    Store.save();
+  }
+  function linkAccount(pendingId, targetId) {
+    const cur = requireAccountManager();
+    if (pendingId === targetId) fail('같은 회원끼리는 연결할 수 없습니다.');
+    const pe = find('users', pendingId); const t = find('users', targetId);
+    if (!pe || !t) fail('회원이 없습니다.');
+    if (pe.status !== 'pending') fail('승인 대기 중인 회원만 다른 회원에 연결할 수 있습니다.');
+    if (t.status === 'pending') fail('연결할 대상은 승인된 회원이어야 합니다.');
+    const D_ = D();
+    if (D_.projects.some((p) => p.ownerId === pe.id) || D_.versions.some((v) => v.authorId === pe.id) || D_.mergeRequests.some((m) => m.authorId === pe.id)
+      || D_.forkRequests.some((r) => r.requesterId === pe.id) || D_.comments.some((c) => c.authorId === pe.id) || D_.contributors.some((c) => c.userId === pe.id)
+      || D_.reports.some((r) => r.reporterId === pe.id) || (pe.roles || []).length) fail('올린 기록이 있는 회원은 연결(병합)할 수 없습니다.');
+    const emails = D_.accounts.filter((a) => a.memberId === pe.id).map((a) => a.email);
+    D_.accounts.filter((a) => a.memberId === pe.id).forEach((a) => { a.memberId = t.id; a.linkedBy = cur.id; a.linkedAt = now(); });
+    D_.users = D_.users.filter((x) => x.id !== pe.id);
+    D_.notifications = D_.notifications.filter((n) => n.userId !== pe.id);
+    audit('account.merged', t.id, { from_member: pe.id, from_member_no: pe.memberNo, from_name: pe.name, emails });
+    notify(t.id, '새 로그인 계정이 내 회원 정보에 연결되었습니다.', '#/me');
+    Store.save();
+  }
+  function unlinkAccount(authId) {
+    requireAccountManager();
+    const a = D().accounts.find((x) => x.authId === authId);
+    if (!a || a.status !== 'active') fail('연결된 계정이 아닙니다.');
+    if (D().accounts.filter((x) => x.memberId === a.memberId && x.status === 'active').length <= 1) fail('회원의 마지막 로그인 계정은 해제할 수 없습니다.');
+    a.status = 'unlinked';
+    audit('account.unlinked', a.memberId, { email: a.email, auth_id: authId });
+    notify(a.memberId, '로그인 계정 하나의 연결이 해제되었습니다.', '#/me');
+    Store.save();
+  }
+
+  /* ---------- 운영 연도·차시 ---------- */
+  const currentYear = () => operatingYear();
+  /** 몇 번 불러도 같은 결과. 지우는 것은 아무것도 없다. (서버 ensure_academic_year 와 같은 규칙) */
+  function ensureAcademicYear() {
+    const db = D(); const y = operatingYear(); let created = false;
+    const addYear = (yr, status) => { db.years.push({ year: yr, ...yearBounds(yr), status }); };
+    if (!db.years.some((a) => a.year === y)) { addYear(y, 'current'); created = true; }
+    db.years.forEach((a) => { if (a.year < y) a.status = 'archived'; });
+    db.projects.forEach((p) => { if (p.year != null && p.year < y && !db.years.some((a) => a.year === p.year)) addYear(p.year, 'archived'); });
+    db.years.forEach((a) => {
+      for (let no = 1; no <= 10; no++) {
+        if (!db.sessions.some((x) => x.year === a.year && x.no === no)) db.sessions.push({ id: uid('s'), year: a.year, no, title: `${no}차시`, heldOn: null, description: '' });
+      }
+    });
+    if (created) {
+      const prev = Math.max(...db.membership.filter((m) => m.year < y).map((m) => m.year), -Infinity);
+      const have = (id) => db.membership.some((m) => m.memberId === id && m.year === y);
+      if (prev !== -Infinity) {
+        db.membership.filter((m) => m.year === prev && m.status === 'active').forEach((m) => {
+          const u = find('users', m.memberId);
+          if (u && u.status === 'active' && !have(m.memberId)) db.membership.push({ memberId: m.memberId, year: y, generation: m.generation, grade: m.grade == null ? null : m.grade + 1, roles: [...(u.roles || [])], status: 'active' });
+        });
+      } else {
+        db.users.filter((u) => u.status === 'active').forEach((u) => db.membership.push({ memberId: u.id, year: y, generation: u.generation ?? null, grade: null, roles: [...(u.roles || [])], status: 'active' }));
+      }
+    }
+    db.years.sort((a, b) => b.year - a.year);
+    Store.save();
+    return y;
+  }
+  function years() { requireReader(); return [...D().years].sort((a, b) => b.year - a.year); }
+  function sessionsOf(year) { requireReader(); return D().sessions.filter((s) => s.year === Number(year)).sort((a, b) => a.no - b.no); }
+  function sessionById(id) { requireReader(); return D().sessions.find((s) => s.id === id) || null; }
+  function sessionIdsOf(projectId) { return D().projectSessions.filter((x) => x.projectId === projectId).map((x) => x.sessionId); }
+  function sessionsOfProject(projectId) { requireReader(); return sessionIdsOf(projectId).map((id) => D().sessions.find((s) => s.id === id)).filter(Boolean).sort((a, b) => b.year - a.year || a.no - b.no); }
+  /** 차시에 연결된 코드 프로젝트 (보이는 것만, 삭제된 것 제외) */
+  function projectsOfSession(sessionId) {
+    requireReader();
+    return D().projectSessions.filter((x) => x.sessionId === sessionId).map((x) => rawProject(x.projectId)).filter((p) => p && !p.deleted && canSee(p))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+  /** 현재 운영 연도에 올라왔지만 어느 차시에도 연결되지 않은 프로젝트 (관리자용) */
+  function unclassifiedProjects() {
+    requireAdmin(); const y = operatingYear();
+    return D().projects.filter((p) => !p.deleted && p.year === y && !D().projectSessions.some((x) => x.projectId === p.id)).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+  function membershipOf(year) { requireReader(); return D().membership.filter((m) => m.year === Number(year)); }
+  const isPastYear = (year) => Number(year) !== operatingYear();
+  function updateSession(id, { title, heldOn, description }) {
+    requireActive();
+    const s = D().sessions.find((x) => x.id === id) || fail('차시가 없습니다.');
+    const past = isPastYear(s.year);
+    if (past) { if (!isAdmin(me())) fail('지난 연도의 차시는 관리자만 고칠 수 있습니다.'); }
+    else if (!isStaff(me())) fail('운영진 권한이 필요합니다.');
+    title = String(title || '').trim(); if (!title) fail('차시 제목을 입력하세요.');
+    if (title.length > 100) fail('차시 제목은 100자까지 쓸 수 있습니다.');
+    if (String(description || '').length > 1000) fail('차시 설명은 1000자까지 쓸 수 있습니다.');
+    s.title = title; s.heldOn = heldOn || null; s.description = String(description || '').trim();
+    if (past) audit('session.updated_past', null, { session: id, year: s.year, no: s.no, title });
+    Store.save();
+  }
+  function checkSessionLink(projectId, sessionId) {
+    const u = requireActive(); const p = getProject(projectId);
+    const s = D().sessions.find((x) => x.id === sessionId) || fail('차시가 없습니다.');
+    if (p.deleted) fail('삭제된 프로젝트입니다.');
+    const past = isPastYear(s.year);
+    if (past) { if (!isAdmin(u)) fail('지난 연도의 차시는 관리자만 연결할 수 있습니다.'); }
+    else if (p.ownerId !== u.id && !isStaff(u)) fail('프로젝트 작성자 또는 운영진만 차시에 연결할 수 있습니다.');
+    return { p, past };
+  }
+  function linkProjectSession(projectId, sessionId) {
+    const { p, past } = checkSessionLink(projectId, sessionId);
+    if (!D().projectSessions.some((x) => x.projectId === projectId && x.sessionId === sessionId)) D().projectSessions.push({ projectId, sessionId, linkedBy: me().id, linkedAt: now() });
+    if (past) audit('session.link_past', p.ownerId, { project: projectId, session: sessionId });
+    Store.save();
+  }
+  function unlinkProjectSession(projectId, sessionId) {
+    const { p, past } = checkSessionLink(projectId, sessionId);
+    D().projectSessions = D().projectSessions.filter((x) => !(x.projectId === projectId && x.sessionId === sessionId));
+    if (past) audit('session.unlink_past', p.ownerId, { project: projectId, session: sessionId });
+    Store.save();
+  }
+  function upsertMembership(memberId, year, generation, grade) {
+    requireAdmin();
+    const t = find('users', memberId) || fail('회원이 없습니다.');
+    year = Number(year);
+    if (!D().years.some((a) => a.year === year)) fail(`${year}년 운영 연도가 없습니다.`);
+    generation = generation === '' || generation == null ? null : Number(generation);
+    grade = grade === '' || grade == null ? null : Number(grade);
+    if (generation != null && !(generation >= 1)) fail('기수는 1 이상이어야 합니다.');
+    if (grade != null && !(grade >= 1 && grade <= 6)) fail('학년은 1~6 사이로 입력하세요.');
+    const row = D().membership.find((m) => m.memberId === memberId && m.year === year);
+    if (row) { row.generation = generation; row.grade = grade; }
+    else D().membership.push({ memberId, year, generation, grade, roles: year === operatingYear() ? [...t.roles] : [], status: t.status });
+    if (year !== operatingYear()) audit('membership.updated_past', memberId, { year, generation, grade });
+    Store.save();
+  }
+
+  /* ---------- 서버 상태 (데모 모드에는 서버가 없다) ---------- */
+  function ping() { return { ok: true, ms: 0, now: now(), lastPing: now(), demo: true }; }
+  function serverStatus() { fail('데모 모드에는 서버가 없어 상세 상태가 없습니다.'); }
+  function canServerDetail(u = me()) { return isAdmin(u) || (hasRole(u, 'server') && hasPerm(u, 'server.detail')); }
+
   return {
-    me, isStaff, isTeacher, login, logout, user, listUsers, approveUser, rejectUser, setUserStatus, setUserRole, setUserGeneration,
+    me, isStaff, isAdmin, isOwner, hasRole, hasPerm, canServerDetail, roleLabel, login, logout, user, listUsers, approveUser, rejectUser, setUserStatus, setUserGeneration,
     settings, updateSettings, rawProject, canSee, getProject, listProjects, generations, childrenOf, treeOf, lineage, contributors,
     versionsOf, getVersion, headOf, versionNumber, createProject, updateProjectInfo, commitVersion,
     forkCheck, forkProject, requestFork, forkRequestsFor, resolveForkRequest, canResolveFor,
     deleteProject, setHidden, mergeRequestsTo, mergeRequestsFrom, createMergeRequest, resolveMergeRequest,
     commentsOf, addComment, deleteComment, report, listReports, resolveReport, hiddenProjects,
     notifications, unreadCount, markRead, markAllRead, activity,
+    holdersOf, appointRole, revokeRole, ownerTransfers, proposeOwnerTransfer, acceptOwnerTransfer, cancelOwnerTransfer, setRolePermission, rolePermissions, auditLogs,
+    accountsOf, listAccounts, listInvites, inviteAccount, linkAccount, unlinkAccount,
+    currentYear, isPastYear, ensureAcademicYear, years, sessionsOf, sessionById, sessionsOfProject, projectsOfSession, unclassifiedProjects, membershipOf,
+    updateSession, linkProjectSession, unlinkProjectSession, upsertMembership, ping, serverStatus,
   };
 })();

@@ -1,0 +1,49 @@
+name: keepalive
+
+# 3일에 한 번 서버(Supabase)에 가벼운 연결 확인(ping) 한 번을 보낸다.
+# - DB 를 한 번 읽을 뿐 데이터를 바꾸지 않는다. 결과는 상태 기록(system_status)에 남는다.
+# - 무료 요금제의 7일 미사용 일시 정지를 예방하는 용도다. 장기 운영이 확실하면 Pro 요금제를 권장한다.
+on:
+  schedule:
+    - cron: '0 3 */3 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Supabase ping
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
+        run: |
+          # 저장소 변수(Settings → Secrets and variables → Actions → Variables)가 비어 있으면 js/config.js 에서 읽는다.
+          # anon 키는 웹페이지에 공개되는 키이므로 비밀이 아니다. (service_role 키는 절대 쓰지 않는다)
+          if [ -z "$SUPABASE_URL" ]; then
+            SUPABASE_URL=$(grep -o "supabaseUrl: *'[^']*'" js/config.js | sed -E "s/.*'([^']*)'/\1/")
+          fi
+          if [ -z "$SUPABASE_ANON_KEY" ]; then
+            SUPABASE_ANON_KEY=$(grep -o "supabaseAnonKey: *'[^']*'" js/config.js | sed -E "s/.*'([^']*)'/\1/")
+          fi
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_ANON_KEY" ]; then
+            echo "::error::SUPABASE_URL / SUPABASE_ANON_KEY 를 찾을 수 없습니다. 저장소 변수나 js/config.js 를 확인하세요."
+            exit 1
+          fi
+          SUPABASE_URL="${SUPABASE_URL%/}"
+          code=$(curl -sS --max-time 30 -o resp.json -w '%{http_code}' -X POST \
+            "$SUPABASE_URL/rest/v1/rpc/ping" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            -H "Content-Type: application/json" -d '{}') || code=000
+          echo "HTTP $code"
+          cat resp.json; echo
+          if [ "$code" != "200" ] || ! grep -q '"ok"[[:space:]]*:[[:space:]]*true' resp.json; then
+            echo "::error::서버가 정상 응답하지 않았습니다. 서버가 일시 정지되었을 수 있습니다(대시보드에서 Restore)."
+            exit 1
+          fi
+          echo "서버 정상"

@@ -665,3 +665,8 @@ body.busy, body.busy * { cursor: progress !important; }
 .ed-usage.over { color: var(--danger); }
 .ed-usage.over .bar span { background: var(--danger); }
 .ed-usage .warn { margin-top: 6px; }
+
+/* ---------- 운영 개편(v2.0): 안내 줄 ---------- */
+.banner-warn { background: var(--warn-soft); border-bottom-color: #f0dca7; color: #6b4a00; flex-wrap: wrap; text-align: center; }
+.banner-warn .i { color: var(--warn); }
+.banner-warn a { text-decoration: underline; text-underline-offset: 3px; }

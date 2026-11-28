@@ -3,16 +3,19 @@
 function makeSeed() {
   const ago = (days, hours = 0) => new Date(Date.now() - (days * 24 + hours) * 3600 * 1000).toISOString();
   const domain = 'example.hs.kr';
-  const U = (id, name, local, role, status, generation, days) => ({ id, name, email: `${local}@${domain}`, role, status, generation, createdAt: ago(days) });
+  // 직책은 roles 배열(복수 보유 가능). 예전 role 칸은 호환용으로 'member' 로 둔다.
+  const U = (id, name, local, roles, status, generation, days) => ({ id, name, email: `${local}@${domain}`, role: 'member', roles, memberNo: '', status, generation, createdAt: ago(days) });
   const users = [
-    U('u_teacher', '김지도 선생님', 'teacher', 'teacher', 'active', null, 200),
-    U('u_sihu', '시후', 'sihu', 'admin', 'active', 3, 180),
-    U('u_minjun', '민준', 'minjun', 'member', 'active', 4, 90),
-    U('u_seoyeon', '서연', 'seoyeon', 'member', 'active', 4, 90),
-    U('u_jiho', '지호', 'jiho', 'member', 'active', 4, 88),
-    U('u_doyun', '도윤 (졸업)', 'doyun', 'member', 'graduated', 2, 400),
-    U('u_haeun', '하은', 'haeun', 'member', 'pending', null, 1),
+    U('u_teacher', '김지도 선생님', 'teacher', ['owner', 'admin'], 'active', null, 200),
+    U('u_sihu', '시후', 'sihu', ['president'], 'active', 3, 180),
+    U('u_minjun', '민준', 'minjun', [], 'active', 4, 90),
+    U('u_seoyeon', '서연', 'seoyeon', [], 'active', 4, 90),
+    U('u_jiho', '지호', 'jiho', [], 'active', 4, 88),
+    U('u_doyun', '도윤 (졸업)', 'doyun', [], 'graduated', 2, 400),
+    U('u_haeun', '하은', 'haeun', [], 'pending', null, 1),
   ];
+  // 회원 번호: 가입 순서대로 POP-0001 ...
+  [...users].sort((a, b) => a.createdAt.localeCompare(b.createdAt)).forEach((u, i) => { u.memberNo = 'POP-' + String(i + 1).padStart(4, '0'); });
 
   /* ---------- 코드 내용 ---------- */
   const rocketReadme = `# 🚀 로켓 시뮬레이션
@@ -218,7 +221,7 @@ box.addEventListener('click', () => {
   /* ---------- 프로젝트·버전 ---------- */
   const projects = [], versions = [];
   function P(id, title, description, ownerId, parentId, rootId, permission, generation, days) {
-    const p = { id, title, description, ownerId, parentId, rootId, permission, generation, createdAt: ago(days), updatedAt: ago(days), deleted: false, hidden: false, headVersionId: null };
+    const p = { id, title, description, ownerId, parentId, rootId, permission, generation, year: operatingYear(Date.now() - days * 86400000), createdAt: ago(days), updatedAt: ago(days), deleted: false, hidden: false, headVersionId: null };
     projects.push(p); return p;
   }
   function V(id, p, authorId, message, days, files, extra = {}) {
@@ -251,7 +254,7 @@ box.addEventListener('click', () => {
   const game = P('p_game', '반응속도 테스트 게임', 'HTML/JS로 만든 반응속도 측정 게임', 'u_jiho', null, 'p_game', 'view', 4, 10);
   V('v_game1', game, 'u_jiho', '처음 업로드', 10, { 'README.md': gameReadme, 'index.html': gameHtml, 'style.css': gameCss, 'script.js': gameJs });
 
-  return {
+  return ensureV2Tables({
     schema: SCHEMA,
     settings: {
       clubName: '코딩 동아리', domain, signupMode: 'approval', maxFileKB: 2048,
@@ -279,5 +282,7 @@ box.addEventListener('click', () => {
       { id: 'n3', userId: 'u_sihu', text: '하은(haeun@example.hs.kr) 님이 가입 승인을 기다립니다.', link: '#/admin?tab=pending', read: false, createdAt: ago(1) },
       { id: 'n4', userId: 'u_teacher', text: '하은(haeun@example.hs.kr) 님이 가입 승인을 기다립니다.', link: '#/admin?tab=pending', read: false, createdAt: ago(1) },
     ],
-  };
+    // 로그인 계정 ↔ 회원 (데모에서는 회원마다 계정 하나)
+    accounts: users.map((u) => ({ authId: 'au_' + u.id, memberId: u.id, email: u.email, status: 'active', linkedAt: u.createdAt })),
+  });
 }

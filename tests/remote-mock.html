@@ -31,11 +31,13 @@ create table auth.identities (id uuid primary key default gen_random_uuid(), use
       grant usage on schema auth to anon, authenticated; grant execute on function auth.uid() to anon, authenticated;`);
     await db.exec(await (await fetch('../supabase/schema.sql')).text());
     await db.exec(`update settings set domain = 'school.hs.kr', club_name = '모의 동아리';
-      update private_settings set teacher_emails = array['t@school.hs.kr'], whitelist = array['a@school.hs.kr', 'b@school.hs.kr'];`);
+      update private_settings set teacher_emails = array['t@school.hs.kr'], whitelist = array['a@school.hs.kr', 'b@school.hs.kr', 'sv@school.hs.kr'];`);
     const users = {};
-    for (const [email, name] of [['t@school.hs.kr', '선생님'], ['a@school.hs.kr', '에이'], ['b@school.hs.kr', '비'], ['p@school.hs.kr', '대기']]) {
+    for (const [email, name] of [['t@school.hs.kr', '선생님'], ['a@school.hs.kr', '에이'], ['b@school.hs.kr', '비'], ['p@school.hs.kr', '대기'], ['sv@school.hs.kr', '서버지기']]) {
       users[email] = (await db.query(`insert into auth.users (email, raw_user_meta_data) values ($1, $2) returning id`, [email, { full_name: name }])).rows[0].id;
     }
+    // 화면 확인용 직책: t = 최고 관리자+관리자(부장 이메일), a = 부장, sv = 서버 관리자. (로그인 계정 ID = 회원 ID 로 시작한다)
+    await db.exec(`insert into user_roles (member_id, role) values ('${users['a@school.hs.kr']}', 'president'), ('${users['sv@school.hs.kr']}', 'server')`);
     let uid = null;
     let queue = Promise.resolve();
     // 한 연결에서 역할을 바꿔 가며 실행하므로 순서대로 처리

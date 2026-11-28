@@ -1,0 +1,79 @@
+name: backup
+
+# 주 1회 DB 를 pg_dump 로 내보내고, 암호화해서 비공개 아티팩트로 90일 보관한다.
+# 필요한 비밀값(Settings → Secrets and variables → Actions → Secrets):
+#   SUPABASE_DB_URL     DB 연결 문자열 (Supabase → Project Settings → Database → Connection string, Session pooler 권장)
+#   BACKUP_PASSPHRASE   백업 암호화 비밀 문구 (잃어버리면 백업을 열 수 없으니 따로 안전하게 보관)
+# 비밀값은 웹페이지·저장소 파일에 절대 적지 않는다.
+on:
+  schedule:
+    - cron: '30 18 * * 0'   # 매주 월요일 03:30 한국 시간
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+    steps:
+      - name: 비밀값 확인
+        id: check
+        run: |
+          if [ -z "$SUPABASE_DB_URL" ] || [ -z "$BACKUP_PASSPHRASE" ]; then
+            echo "::warning::SUPABASE_DB_URL 또는 BACKUP_PASSPHRASE 비밀값이 없어 백업을 건너뜁니다. SETUP.md 의 '백업' 항목을 보세요."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: PostgreSQL 17 클라이언트 설치
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+
+      - name: 덤프·암호화
+        id: dump
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          set -o pipefail
+          stamp=$(date -u +%Y%m%d-%H%M)
+          mkdir -p out
+          # public·private·auth 스키마 모두 포함하되, Supabase 가 관리하는 내부 스키마는 제외한다
+          /usr/lib/postgresql/17/bin/pg_dump "$SUPABASE_DB_URL" --no-owner --no-privileges \
+            --schema=public --schema=private --schema=auth \
+            | gzip -9 \
+            | gpg --symmetric --batch --yes --pinentry-mode loopback --cipher-algo AES256 --passphrase "$BACKUP_PASSPHRASE" \
+                -o "out/pop-hub-$stamp.sql.gz.gpg"
+          ls -l out
+          echo "file=pop-hub-$stamp.sql.gz.gpg" >> "$GITHUB_OUTPUT"
+          echo "size=$(stat -c %s out/pop-hub-$stamp.sql.gz.gpg)" >> "$GITHUB_OUTPUT"
+
+      - name: 아티팩트 업로드 (비공개, 90일)
+        if: steps.check.outputs.ready == 'true' && steps.dump.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pop-hub-backup
+          path: out/*.gpg
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: 상태 기록 (성공)
+        if: steps.check.outputs.ready == 'true' && steps.dump.outcome == 'success'
+        run: |
+          /usr/lib/postgresql/17/bin/psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 \
+            -c "insert into public.system_status (kind, ok, detail) values ('backup', true, jsonb_build_object('file', '${{ steps.dump.outputs.file }}', 'bytes', ${{ steps.dump.outputs.size }}, 'run', '${{ github.run_id }}'))"
+
+      - name: 상태 기록 (실패)
+        if: failure() && steps.check.outputs.ready == 'true'
+        run: |
+          /usr/lib/postgresql/17/bin/psql "$SUPABASE_DB_URL" \
+            -c "insert into public.system_status (kind, ok, detail) values ('backup', false, jsonb_build_object('run', '${{ github.run_id }}'))" || true
