@@ -292,6 +292,8 @@ create table if not exists public.membership_history (
   left_on     date,
   primary key (member_id, year)
 );
+-- [v2.2] 명단 가져오기(CSV)의 직책 칸은 메모로만 보관한다 (직책은 [직책] 탭에서만 부여)
+alter table public.membership_history add column if not exists note text not null default '';
 create table if not exists public.project_sessions (
   project_id  uuid not null references public.projects (id),
   session_id  uuid not null references public.sessions (id),
@@ -1597,6 +1599,9 @@ create table if not exists public.team_projects (
   deleted_at    timestamptz
 );
 create index if not exists team_projects_year_idx on public.team_projects (year);
+-- [v2.2] 관리자만 하는 소프트 삭제: 누가·왜 지웠는지 남기고, 파일은 지우지 않는다
+alter table public.team_projects add column if not exists deleted_by uuid;
+alter table public.team_projects add column if not exists delete_reason text not null default '';
 
 create table if not exists public.team_members (
   team_id     uuid not null references public.team_projects (id),
@@ -1799,9 +1804,29 @@ language sql stable security definer set search_path = public as $$
   select exists (select 1 from team_projects where id = p_team and leader = private.my_member_id())
 $$;
 -- 비공개 작업 공간(파일·메모)을 볼 수 있는가: 팀원 또는 운영진. 서버 관리자는 해당 없음.
+-- [v2.2] 삭제된 팀인가 / 이 사람에게 보이는 팀인가
+create or replace function private.team_is_deleted(p_team uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from team_projects where id = p_team and deleted_at is not null)
+$$;
+create or replace function private.team_visible(p_team uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from team_projects where id = p_team and (deleted_at is null or private.is_admin()))
+$$;
+-- [v2.2] Storage 객체가 어디에서도 쓰이지 않는가 (팀 파일 버전·게시물 첨부·대표 이미지 어디에도 없음)
+create or replace function private.is_orphan_path(p_name text) returns boolean
+language sql stable security definer set search_path = public as $$
+  select p_name is not null
+     and not exists (select 1 from team_file_versions where path = p_name)
+     and not exists (select 1 from post_files where path = p_name)
+     and not exists (select 1 from posts where cover_path = p_name)
+     and not exists (select 1 from team_projects where cover_path = p_name)
+$$;
+-- [v2.2] 삭제된 팀은 관리자 외에는 (팀원·운영진도) 작업 공간을 볼 수 없다
 create or replace function private.can_view_team(p_team uuid) returns boolean
 language sql stable security definer set search_path = public as $$
   select private.is_reader() and (private.is_team_member(p_team) or private.is_staff())
+     and (private.is_admin() or not private.team_is_deleted(p_team))
 $$;
 create or replace function private.team_published(p_team uuid) returns boolean
 language sql stable security definer set search_path = public as $$
@@ -1823,12 +1848,15 @@ language sql stable security definer set search_path = public as $$
   select exists (select 1 from team_file_versions v where v.file_id = p_file and private.version_is_public_final(v.id))
 $$;
 -- 게시물을 볼 수 있는가: 운영진은 전부, 그 외에는 지워지지 않았고 (본인 글이거나 [숨김 아님 + 부원 공개])
+-- [v2.2] 삭제된 팀의 게시물은 관리자만 본다
 create or replace function private.can_read_post(p_id uuid) returns boolean
 language sql stable security definer set search_path = public as $$
   select private.is_reader() and exists (
-    select 1 from posts p where p.id = p_id and (
-      private.is_staff()
-      or (p.deleted_at is null and (p.author = private.my_member_id() or (not p.hidden and p.visibility = 'members')))))
+    select 1 from posts p where p.id = p_id
+      and (p.team_id is null or private.is_admin() or not private.team_is_deleted(p.team_id))
+      and (
+        private.is_staff()
+        or (p.deleted_at is null and (p.author = private.my_member_id() or (not p.hidden and p.visibility = 'members')))))
 $$;
 
 -- Storage 경로별 열람·업로드 권한 (storage.objects 정책에서 쓴다)
@@ -1837,6 +1865,8 @@ language plpgsql stable security definer set search_path = public as $$
 declare k text := split_part(p_name, '/', 1); v_id uuid;
 begin
   if not private.is_reader() then return false; end if;
+  -- [v2.2] 어디에도 연결되지 않은 고아 파일은 정리를 위해 관리자만 볼 수 있다
+  if private.is_admin() and private.is_orphan_path(p_name) then return true; end if;
   if k = 'team' then
     v_id := private.uuid_or_null(split_part(p_name, '/', 2));
     if v_id is null then return false; end if;
@@ -1884,7 +1914,7 @@ begin
 end $$;
 
 -- 비공개 버킷과 Storage 정책. storage 스키마가 없는 DB(테스트 등)에서는 건너뛴다.
--- 수정·삭제 정책은 일부러 만들지 않는다: 올린 파일은 덮어쓸 수 없고, 지우는 일은 관리자가 Supabase 대시보드(Storage)에서만 한다.
+-- 수정 정책은 일부러 만들지 않는다: 올린 파일은 덮어쓸 수 없다. 삭제는 아래 pop_files_delete (관리자 · 고아 파일 · 24시간 경과)뿐이다.
 do $$
 begin
   if to_regclass('storage.buckets') is null or to_regclass('storage.objects') is null then
@@ -1899,6 +1929,11 @@ begin
   execute 'drop policy if exists pop_files_select on storage.objects';
   execute 'create policy pop_files_select on storage.objects for select to authenticated
            using (bucket_id = ''pop-files'' and private.can_read_path(name))';
+  -- [v2.2] 삭제는 관리자가, 어디에도 연결되지 않은 24시간 지난 고아 파일에 한해서만 (그 밖의 파일은 여전히 지울 수 없다)
+  execute 'drop policy if exists pop_files_delete on storage.objects';
+  execute 'create policy pop_files_delete on storage.objects for delete to authenticated
+           using (bucket_id = ''pop-files'' and private.is_admin() and private.is_orphan_path(name)
+                  and created_at < now() - interval ''24 hours'')';
 exception when insufficient_privilege then
   raise notice 'Storage 정책을 만들 권한이 없습니다. SETUP.md 의 Storage 안내를 따라 대시보드에서 직접 만드세요.';
 end $$;
@@ -2575,6 +2610,370 @@ begin
 end $$;
 
 -- ---------------------------------------------------------------------
+-- [v2.2] 3단계: 팀 삭제·복구, 명예의 전당, 명단 가져오기, 저장 공간 관리
+-- ---------------------------------------------------------------------
+-- 직책이 바뀌면 "현재 운영 연도" 명단의 직책 기록도 함께 맞춘다 → 연도가 지나면 그 해 마지막 직책으로 굳는다 (명예의 전당이 읽는다)
+create or replace function private.sync_roles_snapshot() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare v_member uuid;
+begin
+  if tg_op = 'DELETE' then v_member := old.member_id; else v_member := new.member_id; end if;
+  update membership_history
+     set roles = coalesce(array(select ur.role from user_roles ur where ur.member_id = v_member order by ur.role), '{}')
+   where member_id = v_member and year = private.year_of(now());
+  return null;
+end $$;
+drop trigger if exists user_roles_sync_snapshot on public.user_roles;
+create trigger user_roles_sync_snapshot after insert or delete on public.user_roles
+  for each row execute function private.sync_roles_snapshot();
+
+-- 우수 작업물 (명예의 전당)
+create table if not exists public.featured_items (
+  kind         text not null check (kind in ('team', 'post', 'project')),
+  item_id      uuid not null,
+  year         int not null,
+  note         text not null default '',
+  featured_by  uuid references public.profiles (id),
+  featured_at  timestamptz not null default clock_timestamp(),
+  primary key (kind, item_id)
+);
+create index if not exists featured_items_year_idx on public.featured_items (year);
+
+create or replace function private.can_see_item(p_kind text, p_id uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select case p_kind
+    when 'team' then private.team_visible(p_id)
+    when 'post' then private.can_read_post(p_id)
+    when 'project' then private.can_see(p_id)
+    else false end
+$$;
+
+-- 관리자 전용 팀 삭제(소프트 삭제). 파일·기록은 지우지 않고, 관리자 외에는 어디에서도 보이지 않게 한다.
+create or replace function public.delete_team(p_team_id uuid, p_reason text default '') returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; t team_projects; v_now timestamptz := clock_timestamp(); v_posts int; r record;
+begin
+  u := private.require_admin();
+  select * into t from team_projects where id = p_team_id for update;
+  if t.id is null then raise exception '팀 프로젝트를 찾을 수 없습니다.'; end if;
+  if t.deleted_at is not null then raise exception '이미 삭제된 팀입니다.'; end if;
+  perform private.check_len(p_reason, 500, '삭제 사유');
+  update team_projects set deleted_at = v_now, deleted_by = u.id, delete_reason = coalesce(trim(p_reason), ''), updated_at = v_now where id = p_team_id;
+  -- 게시된 팀이면 연결된 동아리 게시물도 함께 소프트 삭제 (복구 때 같은 시각의 것만 되살린다)
+  update posts set deleted_at = v_now where team_id = p_team_id and deleted_at is null;
+  get diagnostics v_posts = row_count;
+  perform private.audit('team.deleted', t.leader, jsonb_build_object('team', p_team_id, 'name', t.name, 'year', t.year, 'reason', coalesce(trim(p_reason), ''), 'posts', v_posts));
+  for r in select member_id from team_members where team_id = p_team_id and status in ('active', 'invited') loop
+    perform private.notify(r.member_id, format('팀 프로젝트 「%s」이(가) 관리자에 의해 삭제되었습니다.', t.name), '#/teams');
+  end loop;
+end $$;
+
+create or replace function public.restore_team(p_team_id uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare t team_projects; r record; v_posts int;
+begin
+  perform private.require_admin();
+  select * into t from team_projects where id = p_team_id for update;
+  if t.id is null then raise exception '팀 프로젝트를 찾을 수 없습니다.'; end if;
+  if t.deleted_at is null then raise exception '삭제된 팀이 아닙니다.'; end if;
+  update posts set deleted_at = null where team_id = p_team_id and deleted_at = t.deleted_at;
+  get diagnostics v_posts = row_count;
+  update team_projects set deleted_at = null, deleted_by = null, delete_reason = '', updated_at = clock_timestamp() where id = p_team_id;
+  perform private.audit('team.restored', t.leader, jsonb_build_object('team', p_team_id, 'name', t.name, 'year', t.year, 'posts', v_posts));
+  for r in select member_id from team_members where team_id = p_team_id and status in ('active', 'invited') loop
+    perform private.notify(r.member_id, format('팀 프로젝트 「%s」이(가) 복구되었습니다.', t.name), '#/team/' || p_team_id);
+  end loop;
+end $$;
+
+-- 우수 작업물 지정/해제: 현재 연도는 운영진, 지난 연도는 관리자만(감사 기록)
+create or replace function public.feature_item(p_kind text, p_item_id uuid, p_note text default '') returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; v_year int; v_title text; t team_projects; po posts; pr projects; v_cur int := private.year_of(now());
+begin
+  u := private.require_staff();   -- 먼저 운영진인지 확인한다 (일반 부원이 항목 존재 여부를 오류 문구로 알아내지 못하게)
+  if p_kind is null or p_kind not in ('team', 'post', 'project') then raise exception '우수 작업물로 올릴 수 없는 종류입니다.'; end if;
+  perform private.check_len(p_note, 200, '메모');
+  if p_kind = 'team' then
+    select * into t from team_projects where id = p_item_id and deleted_at is null;
+    if t.id is null then raise exception '팀 프로젝트를 찾을 수 없습니다.'; end if;
+    if t.published_at is null then raise exception '게시 완료된 팀 프로젝트만 우수 작업물로 올릴 수 있습니다.'; end if;
+    v_year := t.year; v_title := t.name;
+  elsif p_kind = 'post' then
+    select * into po from posts where id = p_item_id and deleted_at is null and not hidden and visibility = 'members';
+    if po.id is null then raise exception '게시물을 찾을 수 없습니다.'; end if;
+    if po.board = 'notice' then raise exception '공지는 우수 작업물로 올릴 수 없습니다.'; end if;
+    v_year := po.year; v_title := po.title;
+  else
+    select * into pr from projects where id = p_item_id and not deleted and not hidden;
+    if pr.id is null then raise exception '프로젝트를 찾을 수 없습니다.'; end if;
+    v_year := coalesce(pr.year, private.year_of(pr.created_at)); v_title := pr.title;
+  end if;
+  if v_year <> v_cur then
+    perform private.require_admin();
+  else
+    perform private.require_staff();
+  end if;
+  insert into featured_items (kind, item_id, year, note, featured_by) values (p_kind, p_item_id, v_year, coalesce(trim(p_note), ''), u.id)
+  on conflict (kind, item_id) do update set note = excluded.note, featured_by = excluded.featured_by, featured_at = clock_timestamp();
+  if v_year <> v_cur then
+    perform private.audit('hall.featured_past', null, jsonb_build_object('kind', p_kind, 'item', p_item_id, 'year', v_year, 'title', v_title));
+  end if;
+end $$;
+
+create or replace function public.unfeature_item(p_kind text, p_item_id uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare f featured_items; v_cur int := private.year_of(now());
+begin
+  perform private.require_staff();
+  select * into f from featured_items where kind = p_kind and item_id = p_item_id;
+  if f.item_id is null then raise exception '우수 작업물로 지정되어 있지 않습니다.'; end if;
+  if f.year <> v_cur then perform private.require_admin(); else perform private.require_staff(); end if;
+  delete from featured_items where kind = p_kind and item_id = p_item_id;
+  if f.year <> v_cur then
+    perform private.audit('hall.unfeatured_past', null, jsonb_build_object('kind', p_kind, 'item', p_item_id, 'year', f.year));
+  end if;
+end $$;
+
+-- 차시 일괄 편집: 한 연도의 차시를 한 번에 고친다 (현재 연도는 운영진, 지난 연도는 관리자 + 감사 기록)
+-- p_items: [{"id": "...", "title": "...", "held_on": "2027-04-01" | "", "description": "..."}]
+create or replace function public.update_sessions_bulk(p_year int, p_items jsonb) returns int
+language plpgsql security definer set search_path = public as $$
+declare
+  e jsonb; s sessions; v_past boolean := p_year <> private.year_of(now()); v_title text; v_date date; v_desc text; v_n int := 0; v_seen uuid[] := '{}'; v_id uuid;
+begin
+  perform private.require_active();
+  if v_past then perform private.require_admin(); else perform private.require_staff(); end if;
+  if p_items is null or jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) = 0 then raise exception '수정할 차시가 없습니다.'; end if;
+  if jsonb_array_length(p_items) > 10 then raise exception '차시는 한 번에 10개까지 고칠 수 있습니다.'; end if;
+  -- 먼저 전부 검사한 뒤 한꺼번에 반영한다 (하나라도 틀리면 아무것도 바꾸지 않는다)
+  for e in select * from jsonb_array_elements(p_items) loop
+    v_id := private.uuid_or_null(e ->> 'id');
+    select * into s from sessions where id = v_id;
+    if s.id is null or s.year <> p_year then raise exception '% 연도의 차시가 아닙니다.', p_year; end if;
+    if v_id = any (v_seen) then raise exception '같은 차시가 두 번 들어 있습니다.'; end if;
+    v_seen := v_seen || v_id;
+    v_title := trim(coalesce(e ->> 'title', ''));
+    if v_title = '' then raise exception '%차시의 제목을 입력하세요.', s.no; end if;
+    perform private.check_len(v_title, 100, '차시 제목'); perform private.check_len(e ->> 'description', 1000, '차시 설명');
+    begin
+      v_date := nullif(trim(coalesce(e ->> 'held_on', '')), '')::date;
+    exception when others then raise exception '%차시의 날짜 형식이 올바르지 않습니다.', s.no;
+    end;
+  end loop;
+  for e in select * from jsonb_array_elements(p_items) loop
+    v_id := (e ->> 'id')::uuid;
+    select * into s from sessions where id = v_id;
+    v_title := trim(e ->> 'title'); v_desc := trim(coalesce(e ->> 'description', ''));
+    v_date := nullif(trim(coalesce(e ->> 'held_on', '')), '')::date;
+    if s.title is distinct from v_title or s.held_on is distinct from v_date or s.description is distinct from v_desc then
+      update sessions set title = v_title, held_on = v_date, description = v_desc where id = v_id;
+      v_n := v_n + 1;
+      if v_past then
+        perform private.audit('session.updated_past', null, jsonb_build_object('session', v_id, 'year', s.year, 'no', s.no, 'title', v_title));
+      end if;
+    end if;
+  end loop;
+  return v_n;
+end $$;
+
+-- ---------------------------------------------------------------------
+-- [v2.2] 명단 가져오기(CSV). 클라이언트가 CSV 를 파싱해 행 목록으로 보내면 서버가 분류하고, 올바른 행만 반영한다.
+--   p_rows: [{"name","generation","grade","email","member_no","note"}]  (note = CSV 의 직책 칸. 메모로만 보관하고 직책은 주지 않는다)
+--   분류: existing(기존 회원) / new(신규) / dup(파일 내 중복) / conflict(회원번호와 이메일이 서로 다른 회원) / error
+--   회원은 회원번호, 없으면 이메일(로그인 계정·회원 이메일·사전 등록)로만 찾는다. 이름으로는 절대 합치지 않는다.
+-- ---------------------------------------------------------------------
+create or replace function private.roster_classify(p_year int, p_rows jsonb) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare
+  s settings; e jsonb; i int := 0; v_out jsonb := '[]'::jsonb;
+  v_name text; v_email text; v_no text; v_gen_t text; v_grade_t text; v_gen int; v_grade int; v_note text;
+  v_a uuid; v_b uuid[]; v_member uuid; v_st text; v_reason text; v_invite boolean; v_activate boolean; v_mname text;
+  seen_emails text[] := '{}'; seen_members uuid[] := '{}'; seen_nos text[] := '{}';
+begin
+  select * into s from settings where id = 1;
+  if p_rows is null or jsonb_typeof(p_rows) <> 'array' or jsonb_array_length(p_rows) = 0 then raise exception '가져올 명단이 없습니다.'; end if;
+  if jsonb_array_length(p_rows) > 500 then raise exception '한 번에 500행까지 가져올 수 있습니다.'; end if;
+  if not exists (select 1 from academic_years where year = p_year) then raise exception '%년 운영 연도가 없습니다.', p_year; end if;
+  for e in select * from jsonb_array_elements(p_rows) loop
+    i := i + 1;
+    v_name := trim(coalesce(e ->> 'name', '')); v_email := lower(trim(coalesce(e ->> 'email', ''))); v_no := upper(trim(coalesce(e ->> 'member_no', '')));
+    v_gen_t := trim(coalesce(e ->> 'generation', '')); v_grade_t := trim(coalesce(e ->> 'grade', '')); v_note := left(trim(coalesce(e ->> 'note', '')), 100);
+    v_st := null; v_reason := null; v_member := null; v_invite := false; v_activate := false; v_gen := null; v_grade := null; v_a := null; v_b := '{}'; v_mname := null;
+    if v_name = '' then v_st := 'error'; v_reason := '이름이 비어 있습니다.';
+    elsif char_length(v_name) > 50 then v_st := 'error'; v_reason := '이름이 50자를 넘습니다.';
+    elsif v_no = '' and v_email = '' then v_st := 'error'; v_reason := '이메일 또는 회원번호가 필요합니다.';
+    elsif v_gen_t <> '' and v_gen_t !~ '^[0-9]{1,3}$' then v_st := 'error'; v_reason := '기수가 올바르지 않습니다. (1 이상의 숫자)';
+    elsif v_grade_t <> '' and v_grade_t !~ '^[0-9]$' then v_st := 'error'; v_reason := '학년이 올바르지 않습니다. (1~6)';
+    elsif v_no <> '' and v_no !~ '^POP-[0-9]{1,8}$' then v_st := 'error'; v_reason := '회원번호 형식이 올바르지 않습니다. (예: POP-0001)';
+    elsif v_email <> '' and v_email !~ '^[^@\s]+@[^@\s]+\.[^@\s]+$' then v_st := 'error'; v_reason := '이메일 형식이 올바르지 않습니다.';
+    elsif v_email <> '' and right(v_email, length(s.domain) + 1) is distinct from '@' || lower(s.domain) then v_st := 'error'; v_reason := format('학교 계정(@%s)이 아닙니다.', s.domain);
+    end if;
+    if v_st is null and v_gen_t <> '' then
+      v_gen := v_gen_t::int;
+      if v_gen < 1 then v_st := 'error'; v_reason := '기수는 1 이상이어야 합니다.'; end if;
+    end if;
+    if v_st is null and v_grade_t <> '' then
+      v_grade := v_grade_t::int;
+      if v_grade not between 1 and 6 then v_st := 'error'; v_reason := '학년은 1~6 사이여야 합니다.'; end if;
+    end if;
+    if v_st is null and ((v_email <> '' and v_email = any (seen_emails)) or (v_no <> '' and v_no = any (seen_nos))) then
+      v_st := 'dup'; v_reason := '파일 안에 같은 이메일 또는 회원번호가 앞에 이미 있습니다.';
+    end if;
+    if v_st is null and v_no <> '' then
+      select id into v_a from profiles where member_no = v_no;
+      if v_a is null then v_st := 'error'; v_reason := '그런 회원번호가 없습니다.'; end if;
+    end if;
+    if v_st is null and v_email <> '' then
+      select coalesce(array_agg(m order by m), '{}') into v_b from (
+        select member_id m from user_accounts where lower(email) = v_email
+        union select user_id from member_emails where lower(email) = v_email
+        union select member_id from account_invites where lower(email) = v_email) x;
+      if cardinality(v_b) > 1 then v_st := 'conflict'; v_reason := '이 이메일이 여러 회원에 연결되어 있습니다.';
+      elsif v_a is not null and cardinality(v_b) = 1 and v_b[1] <> v_a then v_st := 'conflict'; v_reason := '회원번호와 이메일이 서로 다른 회원을 가리킵니다.';
+      end if;
+    end if;
+    if v_st is null then
+      v_member := coalesce(v_a, case when cardinality(v_b) = 1 then v_b[1] end);
+      if v_member is null then
+        v_st := 'new';
+      elsif v_member = any (seen_members) then
+        v_st := 'dup'; v_reason := '파일 안에서 같은 회원이 앞에 이미 있습니다.';
+      else
+        v_st := 'existing';
+      end if;
+    end if;
+    if v_st = 'existing' then
+      select name, (status = 'pending') into v_mname, v_activate from profiles where id = v_member;
+      if v_email <> '' and cardinality(v_b) = 0 then v_invite := true; end if;
+    end if;
+    if v_st in ('new', 'existing') then
+      if v_email <> '' then seen_emails := seen_emails || v_email; end if;
+      if v_no <> '' then seen_nos := seen_nos || v_no; end if;
+      if v_member is not null then seen_members := seen_members || v_member; end if;
+    end if;
+    v_out := v_out || jsonb_build_array(jsonb_build_object(
+      'idx', i, 'name', v_name, 'generation', v_gen, 'grade', v_grade, 'email', v_email, 'member_no', v_no, 'note', v_note,
+      'status', v_st, 'reason', v_reason, 'member_id', v_member, 'member_name', v_mname, 'invite', v_invite, 'activate', coalesce(v_activate, false)));
+  end loop;
+  return v_out;
+end $$;
+
+create or replace function public.preview_roster(p_year int, p_rows jsonb) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare v_rows jsonb;
+begin
+  perform private.require_admin();
+  v_rows := private.roster_classify(p_year, p_rows);
+  return jsonb_build_object('year', p_year, 'rows', v_rows, 'counts', (
+    select coalesce(jsonb_object_agg(st, n), '{}'::jsonb) from (select r ->> 'status' st, count(*) n from jsonb_array_elements(v_rows) r group by 1) x));
+end $$;
+
+create or replace function public.import_roster(p_year int, p_rows jsonb) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare
+  u profiles; v_rows jsonb; r jsonb; v_id uuid; v_status text; v_cur int := private.year_of(now()); v_start date;
+  n_created int := 0; n_updated int := 0; n_skipped int := 0; n_invites int := 0; n_activated int := 0; v_gen int; v_grade int; v_email text;
+  v_activated uuid[] := '{}'; v_invited uuid[] := '{}';
+begin
+  u := private.require_admin();
+  v_rows := private.roster_classify(p_year, p_rows);
+  select starts_on into v_start from academic_years where year = p_year;
+  for r in select * from jsonb_array_elements(v_rows) loop
+    if r ->> 'status' not in ('new', 'existing') then n_skipped := n_skipped + 1; continue; end if;
+    v_gen := (r ->> 'generation')::int; v_grade := (r ->> 'grade')::int; v_email := nullif(r ->> 'email', '');
+    if r ->> 'status' = 'new' then
+      -- 인증 계정은 아직 없다. 사전 등록(account_invites)이 있으므로 그 이메일로 첫 로그인하면 이 회원에 자동 연결된다.
+      insert into profiles (id, name, status, generation) values (gen_random_uuid(), r ->> 'name', 'active', v_gen) returning id into v_id;
+      insert into account_invites (email, member_id, created_by) values (v_email, v_id, u.id);
+      n_created := n_created + 1; n_invites := n_invites + 1; v_invited := v_invited || v_id;
+    else
+      v_id := (r ->> 'member_id')::uuid;
+      if (r ->> 'invite')::boolean and v_email is not null then
+        insert into account_invites (email, member_id, created_by) values (v_email, v_id, u.id) on conflict (email) do nothing;
+        n_invites := n_invites + 1; v_invited := v_invited || v_id;
+      end if;
+      if (r ->> 'activate')::boolean then
+        update profiles set status = 'active' where id = v_id and status = 'pending';
+        v_activated := v_activated || v_id; n_activated := n_activated + 1;
+        perform private.notify(v_id, '가입이 승인되었습니다. 환영합니다!', '#/');
+      end if;
+      if v_gen is not null then update profiles set generation = v_gen where id = v_id and generation is null; end if;
+      n_updated := n_updated + 1;
+    end if;
+    select status into v_status from profiles where id = v_id;
+    insert into membership_history (member_id, year, generation, grade, roles, status, joined_on, note)
+    values (v_id, p_year, v_gen, v_grade,
+            case when p_year = v_cur then coalesce(array(select ur.role from user_roles ur where ur.member_id = v_id order by ur.role), '{}') else '{}' end,
+            v_status, v_start, coalesce(r ->> 'note', ''))
+    on conflict (member_id, year) do update
+      set generation = coalesce(excluded.generation, membership_history.generation),
+          grade = coalesce(excluded.grade, membership_history.grade),
+          note = coalesce(nullif(excluded.note, ''), membership_history.note);
+  end loop;
+  perform private.audit('roster.imported', null, jsonb_build_object('year', p_year, 'created', n_created, 'updated', n_updated, 'skipped', n_skipped,
+    'invites', n_invites, 'activated', n_activated, 'activated_members', to_jsonb(v_activated), 'invited_members', to_jsonb(v_invited), 'rows', jsonb_array_length(v_rows)));
+  return jsonb_build_object('year', p_year, 'created', n_created, 'updated', n_updated, 'skipped', n_skipped, 'invites', n_invites, 'activated', n_activated, 'rows', v_rows);
+end $$;
+
+-- ---------------------------------------------------------------------
+-- [v2.2] 저장 공간 관리 (Supabase 무료 요금제 Storage 1GB). 관리자는 전부, 서버 관리자(server.detail)는 합계만.
+-- ---------------------------------------------------------------------
+create or replace function public.storage_usage() returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare
+  v_admin boolean; v_detail boolean; v_total bigint := 0; v_count bigint := 0; v_by jsonb := null; v_big jsonb := null; v_orph jsonb := null;
+  v_on bigint := null; v_ob bigint := null;
+begin
+  perform private.require_active();
+  v_admin := private.is_admin();
+  v_detail := v_admin or (private.has_role('server') and private.has_perm('server.detail'));
+  if not v_detail then raise exception '저장 공간 상태를 볼 권한이 없습니다.'; end if;
+  if to_regclass('storage.objects') is null then
+    return jsonb_build_object('available', false, 'limit_bytes', 1073741824, 'total_bytes', 0, 'total_count', 0,
+      'by_prefix', case when v_admin then '[]'::jsonb end, 'largest', case when v_admin then '[]'::jsonb end, 'orphans', case when v_admin then '[]'::jsonb end,
+      'orphan_count', case when v_admin then 0 end, 'orphan_bytes', case when v_admin then 0 end);
+  end if;
+  execute $q$ select coalesce(sum(coalesce((metadata ->> 'size')::bigint, 0)), 0)::bigint, count(*)::bigint from storage.objects where bucket_id = 'pop-files' $q$ into v_total, v_count;
+  if v_admin then
+    execute $q$ select coalesce(jsonb_agg(jsonb_build_object('prefix', p, 'bytes', b, 'count', c) order by b desc), '[]'::jsonb)
+                  from (select split_part(name, '/', 1) p, sum(coalesce((metadata ->> 'size')::bigint, 0))::bigint b, count(*) c
+                          from storage.objects where bucket_id = 'pop-files' group by 1) x $q$ into v_by;
+    execute $q$ select coalesce(jsonb_agg(jsonb_build_object('path', name, 'size', size, 'created_at', created_at, 'linked', linked) order by size desc, name), '[]'::jsonb)
+                  from (select o.name, coalesce((o.metadata ->> 'size')::bigint, 0) size, o.created_at,
+                          coalesce(
+                            (select '팀 파일 · ' || t.name || ' / ' || f.name from team_file_versions v join team_files f on f.id = v.file_id join team_projects t on t.id = f.team_id where v.path = o.name limit 1),
+                            (select '게시물 첨부 · ' || p.title from post_files pf join posts p on p.id = pf.post_id where pf.path = o.name limit 1),
+                            (select '게시물 대표 이미지 · ' || p.title from posts p where p.cover_path = o.name limit 1),
+                            (select '팀 대표 이미지 · ' || t.name from team_projects t where t.cover_path = o.name limit 1)) linked
+                          from storage.objects o where o.bucket_id = 'pop-files'
+                         order by 2 desc, o.name limit 20) y $q$ into v_big;
+    execute $q$ select coalesce(jsonb_agg(jsonb_build_object('path', name, 'size', size, 'created_at', created_at, 'deletable', created_at < now() - interval '24 hours') order by created_at, name), '[]'::jsonb)
+                  from (select o.name, coalesce((o.metadata ->> 'size')::bigint, 0) size, o.created_at from storage.objects o
+                         where o.bucket_id = 'pop-files' and private.is_orphan_path(o.name) order by o.created_at, o.name limit 200) z $q$ into v_orph;
+    execute $q$ select count(*)::bigint, coalesce(sum(coalesce((metadata ->> 'size')::bigint, 0)), 0)::bigint from storage.objects
+                 where bucket_id = 'pop-files' and private.is_orphan_path(name) $q$ into v_on, v_ob;
+  end if;
+  return jsonb_build_object('available', true, 'limit_bytes', 1073741824, 'total_bytes', v_total, 'total_count', v_count,
+    'by_prefix', v_by, 'largest', v_big, 'orphans', v_orph, 'orphan_count', v_on, 'orphan_bytes', v_ob);
+end $$;
+
+-- 고아 파일 정리 기록: 파일은 클라이언트가 Storage 에서 지우고(삭제 정책이 서버 쪽에서 다시 검사), 여기서는 실제로 사라졌는지 세어 감사 기록만 남긴다.
+create or replace function public.log_orphan_cleanup(p_paths text[]) returns int
+language plpgsql security definer set search_path = public as $$
+declare v_left bigint := 0; v_n int;
+begin
+  perform private.require_admin();
+  v_n := coalesce(cardinality(p_paths), 0);
+  if v_n = 0 then raise exception '정리한 파일 목록이 비어 있습니다.'; end if;
+  if v_n > 200 then raise exception '한 번에 200개까지 기록할 수 있습니다.'; end if;
+  if to_regclass('storage.objects') is not null then
+    execute $q$ select count(*)::bigint from storage.objects where bucket_id = 'pop-files' and name = any ($1) $q$ into v_left using p_paths;
+  end if;
+  perform private.audit('storage.orphans_cleaned', null, jsonb_build_object('requested', v_n, 'removed', v_n - v_left, 'sample', to_jsonb((select array_agg(x) from (select unnest(p_paths) x limit 10) y))));
+  return (v_n - v_left)::int;
+end $$;
+
+-- ---------------------------------------------------------------------
 -- RLS: 2단계 표 (읽기만, 쓰기는 위 함수로만)
 -- ---------------------------------------------------------------------
 alter table public.team_projects         enable row level security;
@@ -2591,13 +2990,15 @@ alter table public.post_sessions         enable row level security;
 alter table public.post_files            enable row level security;
 alter table public.post_comments         enable row level security;
 alter table public.post_reactions        enable row level security;
+alter table public.featured_items        enable row level security;
 
 -- 팀 이름·설명·상태·팀원 명단은 전체 부원이 볼 수 있고, 파일·메모는 팀원과 운영진만 (게시된 최종본은 전체 부원)
 drop policy if exists read_team_projects on public.team_projects;
-create policy read_team_projects on public.team_projects for select using (private.is_reader() and (deleted_at is null or private.is_staff()));
+create policy read_team_projects on public.team_projects for select using (private.is_reader() and (deleted_at is null or private.is_admin()));
 drop policy if exists read_team_members on public.team_members;
 create policy read_team_members on public.team_members for select
-  using (private.is_reader() and (status = 'active' or member_id = private.my_member_id() or private.is_team_leader(team_id) or private.is_staff()));
+  using (private.is_reader() and private.team_visible(team_id)
+         and (status = 'active' or member_id = private.my_member_id() or private.is_team_leader(team_id) or private.is_staff()));
 drop policy if exists read_team_files on public.team_files;
 create policy read_team_files on public.team_files for select using (private.can_view_team(team_id) or (private.is_reader() and private.file_has_public_final(id)));
 drop policy if exists read_team_file_versions on public.team_file_versions;
@@ -2610,7 +3011,7 @@ create policy read_team_credits on public.team_credits for select using (private
 drop policy if exists read_team_credit_history on public.team_credit_history;
 create policy read_team_credit_history on public.team_credit_history for select using (private.can_view_team(team_id));
 drop policy if exists read_team_project_sessions on public.team_project_sessions;
-create policy read_team_project_sessions on public.team_project_sessions for select using (private.is_reader());
+create policy read_team_project_sessions on public.team_project_sessions for select using (private.is_reader() and private.team_visible(team_id));
 drop policy if exists read_team_final_files on public.team_final_files;
 create policy read_team_final_files on public.team_final_files for select using (private.can_view_team(team_id) or (private.is_reader() and private.team_published(team_id)));
 drop policy if exists read_posts on public.posts;
@@ -2624,6 +3025,9 @@ create policy read_post_comments on public.post_comments for select using (priva
 drop policy if exists read_post_reactions on public.post_reactions;
 create policy read_post_reactions on public.post_reactions for select using (private.can_read_post(post_id));
 
+-- [v2.2] 우수 작업물: 볼 수 있는 대상만 보인다 (삭제된 팀·숨김 프로젝트 등은 가려진다)
+drop policy if exists read_featured_items on public.featured_items;
+create policy read_featured_items on public.featured_items for select using (private.is_reader() and private.can_see_item(kind, item_id));
 
 -- ---------------------------------------------------------------------
 -- RLS: 읽기 정책만 둔다 (쓰기는 위 함수로만)
@@ -2731,6 +3135,8 @@ grant execute on function private.my_member_id(), private.my_status(), private.i
 grant execute on function private.is_team_member(uuid), private.is_team_leader(uuid), private.can_view_team(uuid), private.team_published(uuid),
   private.team_of_file(uuid), private.version_is_public_final(uuid), private.file_has_public_final(uuid), private.can_read_post(uuid),
   private.can_read_path(text), private.can_upload_path(text) to anon, authenticated;
+-- [v2.2] 정책이 쓰는 판단 함수
+grant execute on function private.team_is_deleted(uuid), private.team_visible(uuid), private.is_orphan_path(text), private.can_see_item(text, uuid) to anon, authenticated;
 
 revoke execute on all functions in schema public from public, anon;
 grant execute on all functions in schema public to authenticated;

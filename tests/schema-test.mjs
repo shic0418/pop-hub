@@ -704,7 +704,9 @@ await as(T, `select appoint_role($1, 'server')`, [SV2]);
 r = await db.query(`select public, file_size_limit from storage.buckets where id = 'pop-files'`);
 ok(r.rows.length === 1 && r.rows[0].public === false, 'pop-files 버킷은 비공개로 만들어짐');
 ok(await cnt(`select 1 from pg_policies where schemaname = 'storage' and tablename = 'objects' and policyname in ('pop_files_insert', 'pop_files_select')`) === 2, 'Storage 정책(추가·열람) 2개');
-ok(await cnt(`select 1 from pg_policies where schemaname = 'storage' and tablename = 'objects' and cmd in ('UPDATE', 'DELETE', 'ALL')`) === 0, 'Storage 수정·삭제 정책은 없음(덮어쓰기·삭제 불가)');
+ok(await cnt(`select 1 from pg_policies where schemaname = 'storage' and tablename = 'objects' and cmd in ('UPDATE', 'ALL')`) === 0, 'Storage 수정 정책은 없음(덮어쓰기 불가)');
+ok(await cnt(`select 1 from pg_policies where schemaname = 'storage' and tablename = 'objects' and cmd = 'DELETE' and policyname = 'pop_files_delete'`) === 1
+  && await cnt(`select 1 from pg_policies where schemaname = 'storage' and tablename = 'objects' and cmd = 'DELETE'`) === 1, 'Storage 삭제 정책은 관리자용 고아 파일 정리 하나뿐');
 ok((await db.query(`select max_upload_mb from settings`)).rows[0].max_upload_mb === 20, '업로드 한도 기본 20MB');
 r = await as(ST, `select update_settings(p_max_upload_mb => 5)`);
 ok(r.err?.includes('관리자만'), '운영진(비관리자)은 업로드 한도를 못 바꿈');
@@ -1261,7 +1263,392 @@ ok(!!r.err, '승인 대기 회원은 팀을 만들 수 없음');
   const cntAfter = [await cnt(`select 1 from team_projects`), await cnt(`select 1 from posts`), await cnt(`select 1 from team_file_versions`), await cnt(`select 1 from reports`)];
   ok(J(cntBefore) === J(cntAfter), '재적용해도 팀·게시물·버전·신고가 그대로');
   ok((await db.query(`select max_upload_mb from settings`)).rows[0].max_upload_mb === 20, '재적용해도 설정 유지');
-  ok(await cnt(`select 1 from storage.buckets where id = 'pop-files'`) === 1 && await cnt(`select 1 from pg_policies where schemaname = 'storage' and policyname like 'pop_files_%'`) === 2, '재적용해도 버킷 1개·정책 2개');
+  ok(await cnt(`select 1 from storage.buckets where id = 'pop-files'`) === 1 && await cnt(`select 1 from pg_policies where schemaname = 'storage' and policyname like 'pop_files_%'`) === 3, '재적용해도 버킷 1개·정책 3개(추가·열람·고아 정리)');
+}
+
+{
+// =====================================================================
+// v2.2: 3단계 — 팀 삭제·복구, 명예의 전당, CSV 명단, 저장 공간 관리, 차시 일괄 편집
+// =====================================================================
+const VC = await newMember('vc3@school.hs.kr', '차장3');
+await as(T, `select appoint_role($1, 'vice')`, [VC]);
+const AD = await newMember('ad3@school.hs.kr', '관리자3');
+await as(P1, `select appoint_role($1, 'admin')`, [AD]);   // 최고 관리자는 앞선 시험에서 P1 로 이양되었다
+// 지난 연도(작년) 운영 연도·차시가 있어야 하는 시험을 위해 보장해 둔다
+await db.query(`insert into academic_years (year, starts_on, ends_on, status) values (${curYear - 1}, make_date(${curYear - 1}, 3, 1), make_date(${curYear}, 3, 1) - 1, 'archived') on conflict do nothing`);
+await db.query(`insert into sessions (year, no, title) select ${curYear - 1}, g, g || '차시' from generate_series(1, 10) g on conflict do nothing`);
+
+// 33. 관리자 전용 팀 삭제·복구
+const mkTeam = async (name, { year = curYear, status = 'published', leader = TL, members = [TM], withPost = true } = {}) => {
+  const id = uuidv();
+  await db.query(`insert into team_projects (id, name, leader, year, status, published_at) values ($1, $2, $3, $4, $5, $6)`,
+    [id, name, leader, year, status, status === 'published' ? new Date().toISOString() : null]);
+  await db.query(`insert into team_members (team_id, member_id, status, joined_at, role_label) values ($1, $2, 'active', now(), '팀장')`, [id, leader]);
+  for (const m of members) await db.query(`insert into team_members (team_id, member_id, status, joined_at) values ($1, $2, 'active', now())`, [id, m]);
+  const file = uuidv(), ver = uuidv(), path = `team/${id}/${uuidv()}-final.pdf`;
+  await db.query(`insert into team_files (id, team_id, name, created_by) values ($1, $2, 'final.pdf', $3)`, [file, id, leader]);
+  await db.query(`insert into team_file_versions (id, file_id, version_no, orig_name, path, size, uploaded_by) values ($1, $2, 1, 'final.pdf', $3, 1000, $4)`, [ver, file, path, leader]);
+  await db.query(`insert into team_final_files (team_id, file_version_id) values ($1, $2)`, [id, ver]);
+  await db.query(`insert into team_credits (team_id, member_id, display_name, status, confirmed_at) values ($1, $2, '제작자', 'confirmed', now())`, [id, leader]);
+  await db.query(`insert into team_notes (team_id, author, kind, body) values ($1, $2, 'note', '비공개 메모')`, [id, leader]);
+  await db.query(`insert into team_project_sessions (team_id, session_id) values ($1, $2)`, [id, SCUR]);
+  await putObj(path, 1000);
+  let post = null;
+  if (withPost && status === 'published') {
+    post = uuidv();
+    await db.query(`insert into posts (id, author, board, title, body, visibility, team_id, year) values ($1, $2, 'club', $3, '', 'members', $4, $5)`, [post, leader, name, id, year]);
+    await db.query(`insert into post_sessions (post_id, session_id) values ($1, $2)`, [post, SCUR]);
+  }
+  return { id, file, ver, path, post };
+};
+const DT = await mkTeam('삭제대상팀');
+const seeCnt = async (uid, table, where) => (await as(uid, `select count(*)::int n from ${table} where ${where}`)).rows?.[0]?.n ?? -1;
+ok(await seeCnt(TX, 'team_projects', `id = '${DT.id}'`) === 1 && await seeCnt(TX, 'posts', `id = '${DT.post}'`) === 1 && await objCount(TX, DT.path) === 1, '삭제 전에는 일반 부원도 게시된 팀·게시물·최종본을 봄');
+for (const [uid, label] of [[TL, '팀장'], [TM, '팀원'], [ST, '부장(운영진)'], [VC, '차장(운영진)'], [SV2, '서버 관리자'], [TX, '일반 부원']]) {
+  r = await as(uid, `select delete_team($1, '시험')`, [DT.id]);
+  ok(r.err?.includes('관리자 권한'), `${label}은 팀을 삭제할 수 없음`);
+}
+r = await as(null, `select delete_team($1, '시험')`, [DT.id]);
+ok(!!r.err, '비로그인은 팀을 삭제할 수 없음');
+ok(await cnt(`select 1 from team_projects where id = '${DT.id}' and deleted_at is null`) === 1, '거절된 삭제는 아무것도 바꾸지 않음');
+r = await as(AD, `select delete_team($1, repeat('가', 501))`, [DT.id]);
+ok(r.err?.includes('500자'), '삭제 사유는 500자까지');
+r = await as(AD, `select delete_team($1, '중복 제작물')`, [uuidv()]);
+ok(r.err?.includes('찾을 수 없'), '없는 팀 삭제는 오류');
+const auditBefore = await cnt(`select 1 from audit_logs where action = 'team.deleted'`);
+r = await as(AD, `select delete_team($1, '중복 제작물')`, [DT.id]);
+ok(!r.err, '관리자(비최고)가 팀을 삭제');
+r = await db.query(`select deleted_at is not null d, deleted_by, delete_reason from team_projects where id = $1`, [DT.id]);
+ok(r.rows[0].d && r.rows[0].deleted_by === AD && r.rows[0].delete_reason === '중복 제작물', '소프트 삭제: 시각·삭제자·사유 기록');
+ok(await cnt(`select 1 from team_file_versions where id = '${DT.ver}'`) === 1 && await cnt(`select 1 from storage.objects where name = '${DT.path}'`) === 1, '파일은 지워지지 않고 그대로 보관');
+ok(await cnt(`select 1 from posts where id = '${DT.post}' and deleted_at is not null`) === 1, '게시된 팀이면 연결된 동아리 게시물도 소프트 삭제');
+ok(await cnt(`select 1 from audit_logs where action = 'team.deleted'`) === auditBefore + 1, '팀 삭제가 감사 기록에 남음');
+ok((await db.query(`select detail from audit_logs where action = 'team.deleted' order by id desc limit 1`)).rows[0].detail.reason === '중복 제작물', '감사 기록에 사유 포함');
+ok(await cnt(`select 1 from notifications where user_id = '${TM}' and text like '%삭제대상팀%삭제되었습니다%'`) === 1 && await cnt(`select 1 from notifications where user_id = '${TL}' and text like '%삭제대상팀%삭제되었습니다%'`) === 1, '팀원·팀장에게 알림');
+r = await as(AD, `select delete_team($1, '')`, [DT.id]);
+ok(r.err?.includes('이미 삭제'), '이미 삭제된 팀은 다시 삭제 불가');
+// 관리자 외에는 어디에서도 보이지 않는다 (행·Storage·게시물)
+for (const [uid, label] of [[TX, '일반 부원'], [TM, '팀원'], [TL, '팀장'], [ST, '부장'], [VC, '차장'], [SV2, '서버 관리자']]) {
+  ok(await seeCnt(uid, 'team_projects', `id = '${DT.id}'`) === 0, `삭제된 팀: ${label}에게 팀이 안 보임`);
+  ok(await seeCnt(uid, 'team_members', `team_id = '${DT.id}'`) === 0 && await seeCnt(uid, 'team_files', `team_id = '${DT.id}'`) === 0
+    && await seeCnt(uid, 'team_file_versions', `id = '${DT.ver}'`) === 0 && await seeCnt(uid, 'team_notes', `team_id = '${DT.id}'`) === 0
+    && await seeCnt(uid, 'team_credits', `team_id = '${DT.id}'`) === 0 && await seeCnt(uid, 'team_final_files', `team_id = '${DT.id}'`) === 0
+    && await seeCnt(uid, 'team_project_sessions', `team_id = '${DT.id}'`) === 0, `삭제된 팀: ${label}에게 멤버·파일·메모·제작자·차시 연결이 안 보임`);
+  ok(await seeCnt(uid, 'posts', `id = '${DT.post}'`) === 0 && await seeCnt(uid, 'post_sessions', `post_id = '${DT.post}'`) === 0, `삭제된 팀: ${label}에게 연결된 게시물이 안 보임`);
+  ok(await objCount(uid, DT.path) === 0, `삭제된 팀: ${label}는 Storage 파일도 못 봄`);
+}
+ok(await seeCnt(T, 'team_projects', `id = '${DT.id}'`) === 1 && await seeCnt(AD, 'team_members', `team_id = '${DT.id}'`) === 2 && await seeCnt(T, 'posts', `id = '${DT.post}'`) === 1
+  && await objCount(AD, DT.path) === 1, '관리자는 삭제된 팀·멤버·게시물·파일을 계속 볼 수 있음');
+r = await as(TL, `select add_team_note($1, 'note', 'x')`, [DT.id]);
+ok(r.err?.includes('찾을 수 없'), '삭제된 팀에는 팀장도 쓸 수 없음');
+r = await as(TM, `select leave_team($1)`, [DT.id]);
+ok(!!r.err, '삭제된 팀은 탈퇴 등 어떤 쓰기도 불가');
+r = await as(TM, `insert into storage.objects (bucket_id, name, metadata) values ('pop-files', $1, '{"size":10}')`, [`team/${DT.id}/${uuidv()}-new.pdf`]);
+ok(!!r.err, '삭제된 팀 폴더에는 업로드 불가');
+r = await as(ST, `select add_post_comment($1, 'x')`, [DT.post]);
+ok(!!r.err, '삭제된 팀의 게시물에는 운영진도 댓글 불가');
+// 복구
+for (const [uid, label] of [[TL, '팀장'], [ST, '부장'], [SV2, '서버 관리자']]) {
+  r = await as(uid, `select restore_team($1)`, [DT.id]);
+  ok(r.err?.includes('관리자 권한'), `${label}은 팀을 복구할 수 없음`);
+}
+r = await as(AD, `select restore_team($1)`, [uuidv()]);
+ok(r.err?.includes('찾을 수 없'), '없는 팀 복구는 오류');
+r = await as(AD, `select restore_team($1)`, [DT.id]);
+ok(!r.err, '관리자가 팀 복구');
+ok(await seeCnt(TX, 'team_projects', `id = '${DT.id}'`) === 1 && await seeCnt(TX, 'posts', `id = '${DT.post}'`) === 1 && await objCount(TX, DT.path) === 1, '복구하면 팀·게시물·최종본이 다시 보임');
+ok(await seeCnt(TM, 'team_notes', `team_id = '${DT.id}'`) === 1 && await seeCnt(ST, 'team_members', `team_id = '${DT.id}'`) === 2, '복구하면 팀원·운영진의 작업 공간도 되살아남');
+ok(await cnt(`select 1 from audit_logs where action = 'team.restored'`) === 1, '팀 복구가 감사 기록에 남음');
+r = await as(AD, `select restore_team($1)`, [DT.id]);
+ok(r.err?.includes('삭제된 팀이 아닙니다'), '삭제되지 않은 팀은 복구 대상이 아님');
+// 따로 지워 둔 게시물은 팀 복구로 되살아나지 않는다
+const DT2 = await mkTeam('이중삭제팀');
+await db.query(`update posts set deleted_at = now() - interval '1 day' where id = $1`, [DT2.post]);
+await as(AD, `select delete_team($1, '')`, [DT2.id]);
+await as(AD, `select restore_team($1)`, [DT2.id]);
+ok(await cnt(`select 1 from posts where id = '${DT2.post}' and deleted_at is not null`) === 1 && await seeCnt(TX, 'team_projects', `id = '${DT2.id}'`) === 1, '먼저 따로 삭제된 게시물은 팀을 복구해도 그대로 삭제 상태');
+// 게시 전(초안) 팀도 삭제 가능, 게시물 없음
+const DT3 = await mkTeam('초안팀', { status: 'active', withPost: false });
+r = await as(AD, `select delete_team($1, '')`, [DT3.id]);
+ok(!r.err && await seeCnt(TM, 'team_projects', `id = '${DT3.id}'`) === 0 && await cnt(`select 1 from posts where team_id = '${DT3.id}'`) === 0, '게시 전 팀도 삭제되고 부원에게서 사라짐');
+// 지난 연도 팀도 관리자는 삭제 가능
+const DT4 = await mkTeam('작년삭제팀', { year: curYear - 1 });
+r = await as(AD, `select delete_team($1, '정리')`, [DT4.id]);
+ok(!r.err, '지난 연도 팀도 관리자는 삭제할 수 있음');
+await as(AD, `select restore_team($1)`, [DT4.id]);
+
+// 34. 명예의 전당: 우수 작업물, 직책 기록
+const HT = await mkTeam('우수팀');
+r = await as(TX, `select feature_item('team', $1, '훌륭함')`, [HT.id]);
+ok(r.err?.includes('운영진'), '일반 부원은 우수 작업물을 지정할 수 없음');
+r = await as(SV2, `select feature_item('team', $1, '')`, [HT.id]);
+ok(!!r.err, '서버 관리자는 우수 작업물을 지정할 수 없음');
+r = await as(ST, `select feature_item('team', $1, repeat('가', 201))`, [HT.id]);
+ok(r.err?.includes('200자'), '메모는 200자까지');
+r = await as(ST, `select feature_item('bogus', $1, '')`, [HT.id]);
+ok(r.err?.includes('종류'), '알 수 없는 종류는 거절');
+const DRAFT = await mkTeam('미게시팀', { status: 'active', withPost: false });
+r = await as(ST, `select feature_item('team', $1, '')`, [DRAFT.id]);
+ok(r.err?.includes('게시 완료'), '게시 전 팀은 우수 작업물로 올릴 수 없음');
+r = await as(ST, `select feature_item('team', $1, '발표회 최우수')`, [HT.id]);
+ok(!r.err, '운영진이 현재 연도 팀을 우수 작업물로 지정');
+r = await as(TL, `select create_project('명예 프로젝트', '', 'free', 4, $1::jsonb) id`, [files()]);
+const PRJ = r.rows[0].id;
+r = await as(VC, `select feature_item('project', $1, '')`, [PRJ]);
+ok(!r.err, '운영진이 코드 프로젝트를 지정');
+r = await as(ST, `select feature_item('post', $1, '')`, [HT.post]);
+ok(!r.err, '운영진이 게시물을 지정');
+r = await as(ST, `select feature_item('team', $1, '다시 쓴 메모')`, [HT.id]);
+ok(!r.err && (await db.query(`select note from featured_items where item_id = $1`, [HT.id])).rows[0].note === '다시 쓴 메모' && await cnt(`select 1 from featured_items`) === 3, '다시 지정하면 메모만 바뀌고 중복되지 않음');
+const noticeId = (await db.query(`select id from posts where board = 'notice' limit 1`)).rows[0]?.id;
+if (noticeId) { r = await as(ST, `select feature_item('post', $1, '')`, [noticeId]); ok(r.err?.includes('공지'), '공지는 우수 작업물로 올릴 수 없음'); }
+ok(await seeCnt(TX, 'featured_items', 'true') === 3, '부원은 우수 작업물 목록을 봄');
+r = await as(TX, `insert into featured_items (kind, item_id, year) values ('team', '${HT.id}', 2020)`);
+ok(!!r.err, '우수 작업물 표 직접 쓰기 차단');
+r = await as(null, `select count(*)::int n from featured_items`);
+ok(r.rows[0].n === 0, '비로그인은 우수 작업물을 못 봄');
+await as(AD, `select delete_team($1, '')`, [HT.id]);
+ok(await seeCnt(TX, 'featured_items', `kind = 'team'`) === 0 && await seeCnt(TX, 'featured_items', 'true') === 1 && await seeCnt(AD, 'featured_items', `kind = 'post'`) === 1, '삭제된 팀·게시물의 우수 작업물 표시는 관리자 외에는 가려짐');
+await as(AD, `select restore_team($1)`, [HT.id]);
+ok(await seeCnt(TX, 'featured_items', 'true') === 3, '복구하면 우수 작업물도 다시 보임');
+r = await as(TX, `select unfeature_item('team', $1)`, [HT.id]);
+ok(r.err?.includes('운영진'), '일반 부원은 지정 해제도 불가');
+r = await as(ST, `select unfeature_item('post', $1)`, [HT.post]);
+ok(!r.err && await cnt(`select 1 from featured_items`) === 2, '운영진이 현재 연도 지정을 해제');
+r = await as(ST, `select unfeature_item('post', $1)`, [HT.post]);
+ok(r.err?.includes('지정되어 있지 않'), '지정되지 않은 항목 해제는 오류');
+// 지난 연도 항목: 관리자만 + 감사 기록
+const OT = await mkTeam('작년우수팀', { year: curYear - 1 });
+r = await as(ST, `select feature_item('team', $1, '')`, [OT.id]);
+ok(r.err?.includes('관리자 권한'), '지난 연도 항목의 지정은 관리자만');
+r = await as(AD, `select feature_item('team', $1, '작년 대상')`, [OT.id]);
+ok(!r.err && await cnt(`select 1 from audit_logs where action = 'hall.featured_past'`) === 1, '관리자의 지난 연도 지정은 감사 기록');
+ok((await db.query(`select year from featured_items where item_id = $1`, [OT.id])).rows[0].year === curYear - 1, '우수 작업물은 그 항목의 연도로 분류');
+r = await as(ST, `select unfeature_item('team', $1)`, [OT.id]);
+ok(r.err?.includes('관리자 권한'), '지난 연도 항목의 해제도 관리자만');
+r = await as(AD, `select unfeature_item('team', $1)`, [OT.id]);
+ok(!r.err && await cnt(`select 1 from audit_logs where action = 'hall.unfeatured_past'`) === 1, '관리자의 지난 연도 해제는 감사 기록');
+// 직책 기록(명단의 직책 칸)은 직책이 바뀌면 현재 연도 행만 따라간다
+await db.query(`insert into membership_history (member_id, year, generation, roles, status) values ($1, $2, 3, array['president'], 'active') on conflict (member_id, year) do update set roles = array['president']`, [TX, curYear - 1]);
+await db.query(`insert into membership_history (member_id, year, generation, roles, status) values ($1, $2, 3, '{}', 'active') on conflict (member_id, year) do nothing`, [TX, curYear]);
+await as(T, `select appoint_role($1, 'server')`, [TX]);
+ok((await db.query(`select roles from membership_history where member_id = $1 and year = $2`, [TX, curYear])).rows[0].roles.includes('server'), '직책을 임명하면 현재 연도 명단의 직책 기록이 따라감');
+ok(J((await db.query(`select roles from membership_history where member_id = $1 and year = $2`, [TX, curYear - 1])).rows[0].roles) === '["president"]', '지난 연도 명단의 직책 기록은 그대로(굳음)');
+await as(T, `select revoke_role($1, 'server')`, [TX]);
+ok(!(await db.query(`select roles from membership_history where member_id = $1 and year = $2`, [TX, curYear])).rows[0].roles.includes('server'), '해임하면 현재 연도 직책 기록에서도 빠짐');
+
+// 35. CSV 명단 가져오기
+const ROSTER_YEAR = curYear;
+const rrows = (arr) => JSON.stringify(arr);
+const rr1 = await signup('ex-email@school.hs.kr', '이메일로찾기');
+await as(T, `select approve_user($1, 5)`, [rr1]);
+const PX = await signup('px@school.hs.kr', '대기자');   // 승인 대기 회원 (가입 방식: 승인제)
+const noOf = async (id) => (await db.query(`select member_no from profiles where id = $1`, [id])).rows[0].member_no;
+const TLno = await noOf(TL);
+const rows35 = [
+  { name: '엘', member_no: TLno, generation: '4', grade: '2' },                                           // 1 기존(회원번호)
+  { name: '이메일로찾기', email: 'EX-email@school.hs.kr', grade: '3' },                                    // 2 기존(이메일, 대소문자 무시)
+  { name: '신입일', email: 'new1@school.hs.kr', generation: '6', grade: '1', note: '서버 관리자' },       // 3 신규
+  { name: '신입이', email: 'new2@school.hs.kr' },                                                         // 4 신규(기수·학년 없음)
+  { name: '신입일다시', email: 'NEW1@school.hs.kr', generation: '6' },                                      // 5 파일 내 중복(이메일)
+  { name: '충돌', member_no: TLno, email: 'tm@school.hs.kr' },                                             // 6 충돌(회원번호 ≠ 이메일)... 회원번호 중복이 먼저
+  { name: '외부', email: 'out@gmail.com', generation: '6' },                                              // 7 오류: 도메인
+  { name: '', email: 'noname@school.hs.kr' },                                                             // 8 오류: 이름 없음
+  { name: '학년틀림', email: 'g9@school.hs.kr', grade: '9' },                                              // 9 오류: 학년
+  { name: '정보없음' },                                                                                    // 10 오류: 이메일·회원번호 없음
+  { name: '없는번호', member_no: 'POP-9999' },                                                             // 11 오류: 없는 회원번호
+  { name: '기수틀림', email: 'g@school.hs.kr', generation: 'abc' },                                        // 12 오류: 기수
+  { name: '대기자', email: 'px@school.hs.kr', generation: '5', grade: '2' },                               // 13 기존(승인 대기) → 활성화
+  { name: '엘의새계정', member_no: await noOf(TM), email: 'tm-new@school.hs.kr', generation: '4', grade: '2' }, // 14 기존(회원번호) + 새 이메일 사전 등록
+];
+rows35.splice(5, 1, { name: '충돌', member_no: await noOf(TX), email: 'tm@school.hs.kr' });                // 6 충돌: 회원번호(TX) ≠ 이메일(TM)
+const profilesBefore = await cnt(`select 1 from profiles`);
+const invitesBefore = await cnt(`select 1 from account_invites`);
+const mhBefore = await cnt(`select 1 from membership_history`);
+for (const [uid, label] of [[ST, '부장(운영진)'], [VC, '차장'], [SV2, '서버 관리자'], [TX, '일반 부원']]) {
+  r = await as(uid, `select preview_roster($1, $2::jsonb)`, [ROSTER_YEAR, rrows(rows35)]);
+  ok(r.err?.includes('관리자 권한'), `${label}은 명단 미리보기를 못 함`);
+  r = await as(uid, `select import_roster($1, $2::jsonb)`, [ROSTER_YEAR, rrows(rows35)]);
+  ok(r.err?.includes('관리자 권한'), `${label}은 명단 가져오기를 못 함`);
+}
+r = await as(AD, `select preview_roster($1, $2::jsonb) p`, [ROSTER_YEAR, rrows(rows35)]);
+ok(!r.err, '관리자가 명단 미리보기');
+const pv = r.rows[0].p;
+const st35 = pv.rows.map((x) => x.status);
+ok(J(st35) === J(['existing', 'existing', 'new', 'new', 'dup', 'conflict', 'error', 'error', 'error', 'error', 'error', 'error', 'existing', 'existing']), '행 분류: 기존·신규·중복·충돌·오류 (' + st35.join(',') + ')');
+ok(pv.rows[0].member_id === TL && pv.rows[1].member_id === rr1 && pv.rows[12].member_id === PX, '기존 회원은 회원번호, 없으면 이메일(대소문자 무시)로 찾음');
+ok(pv.rows[12].activate === true && pv.rows[13].invite === true && pv.rows[0].invite === false, '대기 회원은 활성화, 새 이메일은 사전 등록 표시');
+ok(pv.rows[6].reason.includes('학교 계정') && pv.rows[7].reason.includes('이름') && pv.rows[8].reason.includes('학년') && pv.rows[9].reason.includes('이메일 또는 회원번호')
+  && pv.rows[10].reason.includes('회원번호') && pv.rows[11].reason.includes('기수') && pv.rows[5].reason.includes('서로 다른'), '오류·충돌 사유가 행마다 나옴');
+ok(pv.counts.new === 2 && pv.counts.existing === 4 && pv.counts.dup === 1 && pv.counts.conflict === 1 && pv.counts.error === 6, '분류별 개수');
+ok(await cnt(`select 1 from profiles`) === profilesBefore && await cnt(`select 1 from account_invites`) === invitesBefore && await cnt(`select 1 from membership_history`) === mhBefore, '미리보기는 아무것도 쓰지 않음');
+// 같은 이름의 다른 사람은 절대 합치지 않는다
+r = await as(AD, `select preview_roster($1, $2::jsonb) p`, [ROSTER_YEAR, rrows([{ name: '엘', email: 'another-el@school.hs.kr' }])]);
+ok(r.rows[0].p.rows[0].status === 'new', '이름이 같아도 이메일·회원번호가 다르면 신규(이름으로 합치지 않음)');
+r = await as(AD, `select preview_roster($1, $2::jsonb)`, [1999, rrows(rows35)]);
+ok(r.err?.includes('운영 연도가 없'), '없는 연도는 거절');
+r = await as(AD, `select preview_roster($1, '[]'::jsonb)`, [ROSTER_YEAR]);
+ok(r.err?.includes('가져올 명단'), '빈 명단은 거절');
+r = await as(AD, `select preview_roster($1, $2::jsonb)`, [ROSTER_YEAR, rrows(Array.from({ length: 501 }, (_, i) => ({ name: 'n' + i, email: `n${i}@school.hs.kr` })))]);
+ok(r.err?.includes('500'), '500행을 넘으면 거절');
+r = await as(AD, `select preview_roster($1, '{}'::jsonb)`, [ROSTER_YEAR]);
+ok(!!r.err, '배열이 아니면 거절');
+// 가져오기
+const rolesBefore = await cnt(`select 1 from user_roles`);
+r = await as(AD, `select import_roster($1, $2::jsonb) x`, [ROSTER_YEAR, rrows(rows35)]);
+ok(!r.err, '관리자가 명단 가져오기 (' + (r.err || '성공') + ')');
+const im = r.rows?.[0]?.x || {};
+ok(im.created === 2 && im.updated === 4 && im.skipped === 8 && im.invites === 3 && im.activated === 1, '가져오기 결과 집계 ' + J({ c: im.created, u: im.updated, s: im.skipped, i: im.invites, a: im.activated }));
+const N1 = (await db.query(`select p.id, p.name, p.status, p.generation, p.member_no from profiles p join account_invites i on i.member_id = p.id where i.email = 'new1@school.hs.kr'`)).rows[0];
+ok(N1 && N1.name === '신입일' && N1.status === 'active' && N1.generation === 6 && /^POP-\d{4}$/.test(N1.member_no), '신규: 활동 회원으로 만들어지고 회원번호·기수가 붙음');
+ok(await cnt(`select 1 from user_accounts where member_id = '${N1.id}'`) === 0, '신규: 아직 로그인 계정은 없음');
+ok(await cnt(`select 1 from account_invites where email in ('new1@school.hs.kr', 'new2@school.hs.kr', 'tm-new@school.hs.kr')`) === 3, '신규·기존의 새 이메일은 사전 등록으로 들어감');
+r = await db.query(`select generation, grade, roles, note from membership_history where member_id = $1 and year = $2`, [N1.id, ROSTER_YEAR]);
+ok(r.rows[0].generation === 6 && r.rows[0].grade === 1 && r.rows[0].note === '서버 관리자' && r.rows[0].roles.length === 0, '신규: 연도 명단에 기수·학년이 들어가고 직책 칸은 메모로만 저장');
+ok(await cnt(`select 1 from user_roles`) === rolesBefore && await rolesOf(N1.id).then((x) => x.length === 0), 'CSV 로는 직책을 주지 않음');
+r = await db.query(`select generation, grade from membership_history where member_id = $1 and year = $2`, [TL, ROSTER_YEAR]);
+ok(r.rows[0].generation === 4 && r.rows[0].grade === 2, '기존: 연도 명단의 기수·학년이 갱신됨');
+ok((await db.query(`select status from profiles where id = $1`, [PX])).rows[0].status === 'active' && await cnt(`select 1 from membership_history where member_id = '${PX}' and year = ${ROSTER_YEAR}`) === 1, '명단에 오른 승인 대기 회원은 활성화됨');
+ok(await cnt(`select 1 from audit_logs where action = 'roster.imported'`) === 1 && (await db.query(`select detail from audit_logs where action = 'roster.imported'`)).rows[0].detail.created === 2, '가져오기가 개수와 함께 감사 기록에 남음');
+// 멱등: 같은 파일을 다시 가져와도 같은 결과
+const afterFirst = [await cnt(`select 1 from profiles`), await cnt(`select 1 from account_invites`), await cnt(`select 1 from membership_history`)];
+r = await as(AD, `select import_roster($1, $2::jsonb) x`, [ROSTER_YEAR, rrows(rows35)]);
+ok(!r.err && r.rows[0].x.created === 0, '같은 파일을 다시 가져오면 새로 만들어지는 회원이 없음 (' + (r.err || '') + ')');
+ok(J([await cnt(`select 1 from profiles`), await cnt(`select 1 from account_invites`), await cnt(`select 1 from membership_history`)]) === J(afterFirst), '재가져오기: 회원·사전 등록·명단 행 수가 그대로');
+r = await as(AD, `select preview_roster($1, $2::jsonb) p`, [ROSTER_YEAR, rrows(rows35.slice(2, 4))]);
+ok(r.rows[0].p.rows.every((x) => x.status === 'existing'), '재가져오기 미리보기: 앞서 만든 신규는 기존 회원(사전 등록 이메일)으로 분류');
+// 이후 Google 가입이 만들어 둔 회원에 자동 연결
+const g1 = await signup('new1@school.hs.kr', '홍길동');
+ok(await cnt(`select 1 from user_accounts where auth_id = '${g1}' and member_id = '${N1.id}' and status = 'active'`) === 1, '가져온 이메일로 첫 Google 로그인하면 만들어 둔 회원에 자동 연결');
+ok(await cnt(`select 1 from profiles where name = '홍길동'`) === 0 && await cnt(`select 1 from account_invites where email = 'new1@school.hs.kr'`) === 0, '새 회원이 따로 만들어지지 않고 사전 등록은 소진됨');
+r = await as(g1, `select name, status from profiles where id = $1`, [N1.id]);
+ok(r.rows[0]?.name === '신입일' && r.rows[0].status === 'active', '연결된 회원은 이름·활동 상태 그대로 로그인');
+// 기존 회원의 새 이메일도 연결
+const g2 = await signup('tm-new@school.hs.kr', 'x');
+ok(await cnt(`select 1 from user_accounts where auth_id = '${g2}' and member_id = '${TM}'`) === 1, '기존 회원 행의 새 이메일도 첫 로그인 때 그 회원에 연결');
+// 부원 명단 방식에서도 사전 등록된 이메일은 가입됨
+await db.query(`update settings set signup_mode = 'whitelist'`);
+r = await as(AD, `select import_roster($1, $2::jsonb) x`, [ROSTER_YEAR, rrows([{ name: '명단방식', email: 'wl-new@school.hs.kr', generation: '7', grade: '1' }])]);
+ok(!r.err && r.rows[0].x.created === 1, '명단 방식에서도 가져오기');
+const g3 = await signup('wl-new@school.hs.kr', 'y');
+ok(!String(g3).startsWith('ERR:') && await cnt(`select 1 from user_accounts u join profiles p on p.id = u.member_id where u.auth_id = '${g3}' and p.name = '명단방식'`) === 1, '명단(화이트리스트) 방식이어도 가져온 이메일은 가입되고 회원에 연결');
+ok(String(await signup('stranger3@school.hs.kr', 'z')).startsWith('ERR:'), '명단 방식에서 명단·사전 등록에 없는 이메일은 여전히 가입 불가');
+await db.query(`update settings set signup_mode = 'approval'`);
+// 지난 연도 명단에도 가져오기 (직책 기록은 비워 둔다)
+r = await as(AD, `select import_roster($1, $2::jsonb) x`, [curYear - 1, rrows([{ name: '작년졸업', email: 'old-grad@school.hs.kr', generation: '2', grade: '3', note: '부장' }])]);
+ok(!r.err, '지난 연도 명단에도 가져오기');
+{
+  const og = (await db.query(`select member_id from account_invites where email = 'old-grad@school.hs.kr'`)).rows[0].member_id;
+  r = await db.query(`select generation, grade, roles, note from membership_history where member_id = $1 and year = $2`, [og, curYear - 1]);
+  ok(r.rows[0].generation === 2 && r.rows[0].grade === 3 && r.rows[0].roles.length === 0 && r.rows[0].note === '부장' && (await rolesOf(og)).length === 0, '지난 연도 행: 직책은 메모로만 저장되고 부여되지 않음');
+  ok(await cnt(`select 1 from audit_logs where action = 'roster.imported'`) >= 4, '모든 가져오기가 감사 기록에 남음');
+}
+
+// 36. 저장 공간 관리
+const orphOld = `team/${uuidv()}/${uuidv()}-orphan.pdf`, orphNew = `post/${uuidv()}/${uuidv()}-new.png`, refOld = `team/${HT.id}/${uuidv()}-old.pdf`;
+await putObj(orphOld, 5000); await putObj(orphNew, 7000);
+await db.query(`update storage.objects set created_at = now() - interval '3 days' where name = $1`, [orphOld]);
+await putObj(refOld, 2000);
+await db.query(`update storage.objects set created_at = now() - interval '3 days' where name = $1`, [refOld]);
+await db.query(`insert into team_file_versions (file_id, version_no, orig_name, path, size, uploaded_by) values ($1, 2, 'old.pdf', $2, 2000, $3)`, [HT.file, refOld, TL]);
+ok(await cnt(`select 1 from storage.objects where name in ('${orphOld}', '${orphNew}') and private.is_orphan_path(name)`) === 2 && await cnt(`select 1 from storage.objects where name = '${refOld}' and private.is_orphan_path(name)`) === 0, '고아 판정: 어디에도 연결되지 않은 객체만');
+const orphExpect = (await db.query(`select count(*)::int n, coalesce(sum((metadata ->> 'size')::bigint), 0)::int b from storage.objects where bucket_id = 'pop-files' and private.is_orphan_path(name)`)).rows[0];
+r = await as(AD, `select storage_usage() u`);
+const su = r.rows?.[0]?.u;
+ok(!r.err && su.available === true && su.limit_bytes === 1073741824, '관리자: 저장 공간 사용량 (한도 1GB)');
+ok(su.total_count === await cnt(`select 1 from storage.objects where bucket_id = 'pop-files'`) && su.total_bytes > 0, '합계 개수·바이트');
+ok(Array.isArray(su.by_prefix) && su.by_prefix.some((x) => x.prefix === 'team') && su.by_prefix.some((x) => x.prefix === 'post') && su.by_prefix.reduce((a, x) => a + x.bytes, 0) === su.total_bytes, '접두사(team/post/cover)별 합계');
+ok(su.largest.length <= 20 && su.largest.every((x, i, a) => i === 0 || a[i - 1].size >= x.size), '큰 파일 목록은 크기순(최대 20개)');
+ok(su.largest.some((x) => x.linked && x.linked.includes('팀 파일 · 우수팀')), '큰 파일 목록에 연결된 팀·파일 이름이 붙음');
+ok(su.orphan_count === orphExpect.n && su.orphan_bytes === orphExpect.b && su.orphan_bytes >= 12000, '고아 개수·용량 합계');
+ok(su.orphans.find((x) => x.path === orphOld)?.deletable === true && su.orphans.find((x) => x.path === orphNew)?.deletable === false && !su.orphans.some((x) => x.path === refOld), '고아 목록: 24시간 지난 것만 삭제 가능, 연결된 파일은 제외');
+r = await as(SV2, `select storage_usage() u`);
+ok(!r.err && r.rows[0].u.total_count > 0 && r.rows[0].u.by_prefix === null && r.rows[0].u.largest === null && r.rows[0].u.orphans === null, '서버 관리자(server.detail)는 합계만 봄');
+await as(T, `select set_role_permission('server', 'server.detail', false)`);
+r = await as(SV2, `select storage_usage()`);
+ok(r.err?.includes('권한'), '서버 상세 권한을 끄면 저장 공간도 못 봄');
+await as(T, `select set_role_permission('server', 'server.detail', true)`);
+for (const [uid, label] of [[ST, '부장'], [VC, '차장'], [TX, '일반 부원']]) {
+  r = await as(uid, `select storage_usage()`);
+  ok(r.err?.includes('권한'), `${label}은 저장 공간 상태를 못 봄`);
+}
+// 삭제 정책: 관리자 + 고아 + 24시간 경과만
+r = await as(ST, `delete from storage.objects where name = $1 returning name`, [orphOld]);
+ok((r.rows || []).length === 0, '운영진(부장)은 고아 파일도 못 지움');
+for (const [uid, label] of [[TL, '팀장'], [SV2, '서버 관리자'], [VC, '차장']]) {
+  r = await as(uid, `delete from storage.objects where name = $1 returning name`, [orphOld]);
+  ok((r.rows || []).length === 0, `${label}은 고아 파일을 못 지움`);
+}
+r = await as(AD, `delete from storage.objects where name = $1 returning name`, [orphNew]);
+ok((r.rows || []).length === 0, '관리자도 24시간이 안 지난 고아 파일은 못 지움');
+r = await as(AD, `delete from storage.objects where name = $1 returning name`, [refOld]);
+ok((r.rows || []).length === 0, '관리자도 연결된 파일(팀 파일 버전)은 못 지움');
+r = await as(AD, `delete from storage.objects where name = $1 returning name`, [DT.path]);
+ok((r.rows || []).length === 0, '관리자도 일반(연결된) 파일은 못 지움');
+r = await as(AD, `delete from storage.objects where bucket_id = 'pop-files' returning name`);
+ok((r.rows || []).length === 1 && r.rows[0].name === orphOld, '관리자: 전체 삭제를 시도해도 조건에 맞는 고아 파일 하나만 지워짐');
+r = await as(AD, `update storage.objects set name = name || 'x' where name = $1 returning name`, [orphNew]);
+ok((r.rows || []).length === 0, '관리자도 Storage 객체를 수정(덮어쓰기)할 수는 없음');
+// 정리 기록
+r = await as(ST, `select log_orphan_cleanup(array['a'])`);
+ok(r.err?.includes('관리자 권한'), '정리 기록은 관리자만');
+r = await as(AD, `select log_orphan_cleanup('{}'::text[])`);
+ok(r.err?.includes('비어'), '빈 목록은 거절');
+r = await as(AD, `select log_orphan_cleanup(array[$1, $2]) n`, [orphOld, orphNew]);
+ok(!r.err && r.rows[0].n === 1, '정리 기록: 실제로 사라진 파일 수만 셈(1/2)');
+ok((await db.query(`select detail from audit_logs where action = 'storage.orphans_cleaned' order by id desc limit 1`)).rows[0].detail.removed === 1, '고아 파일 정리가 감사 기록에 남음');
+r = await as(AD, `select log_orphan_cleanup($1::text[])`, [Array.from({ length: 201 }, (_, i) => 'p' + i)]);
+ok(r.err?.includes('200'), '한 번에 200개까지');
+
+// 37. 차시 일괄 편집
+const curSess = (await db.query(`select id, no from sessions where year = $1 order by no`, [curYear])).rows;
+const itemsFor = (list, edit = {}) => JSON.stringify(list.map((s) => ({ id: s.id, title: edit[s.no]?.title ?? `${s.no}차시 주제`, held_on: edit[s.no]?.held_on ?? `${curYear}-04-${String(s.no).padStart(2, '0')}`, description: edit[s.no]?.description ?? '' })));
+r = await as(TX, `select update_sessions_bulk($1, $2::jsonb)`, [curYear, itemsFor(curSess)]);
+ok(r.err?.includes('운영진'), '일반 부원은 차시 일괄 편집 불가');
+r = await as(SV2, `select update_sessions_bulk($1, $2::jsonb)`, [curYear, itemsFor(curSess)]);
+ok(!!r.err, '서버 관리자는 차시 일괄 편집 불가');
+r = await as(ST, `select update_sessions_bulk($1, $2::jsonb) n`, [curYear, itemsFor(curSess)]);
+ok(!r.err && r.rows[0].n === 10, '운영진이 현재 연도 10개 차시를 한 번에 수정 (' + (r.err || '') + ')');
+ok((await db.query(`select title, held_on::text d from sessions where id = $1`, [curSess[2].id])).rows[0].title === '3차시 주제' && (await db.query(`select held_on::text d from sessions where id = $1`, [curSess[2].id])).rows[0].d === `${curYear}-04-03`, '제목·날짜 반영');
+r = await as(ST, `select update_sessions_bulk($1, $2::jsonb) n`, [curYear, itemsFor(curSess)]);
+ok(!r.err && r.rows[0].n === 0, '바뀐 것이 없으면 0건 (멱등)');
+r = await as(ST, `select update_sessions_bulk($1, $2::jsonb)`, [curYear, itemsFor(curSess, { 4: { title: '  ' } })]);
+ok(r.err?.includes('제목'), '제목이 비면 거절');
+r = await as(ST, `select update_sessions_bulk($1, $2::jsonb)`, [curYear, itemsFor(curSess, { 5: { held_on: '2026-13-45' } })]);
+ok(r.err?.includes('날짜'), '날짜 형식이 틀리면 거절');
+r = await as(ST, `select update_sessions_bulk($1, $2::jsonb)`, [curYear, itemsFor(curSess, { 1: { title: '바뀌면 안 됨' }, 6: { title: 'x'.repeat(101) } })]);
+ok(r.err?.includes('100자') && (await db.query(`select title from sessions where id = $1`, [curSess[0].id])).rows[0].title === '1차시 주제', '하나라도 틀리면 아무것도 바꾸지 않음(원자적)');
+r = await as(ST, `select update_sessions_bulk($1, $2::jsonb)`, [curYear, JSON.stringify([{ id: curSess[0].id, title: 'a' }, { id: curSess[0].id, title: 'b' }])]);
+ok(r.err?.includes('두 번'), '같은 차시가 두 번이면 거절');
+const pastSess = (await db.query(`select id, no from sessions where year = $1 order by no`, [curYear - 1])).rows;
+r = await as(ST, `select update_sessions_bulk($1, $2::jsonb)`, [curYear, JSON.stringify([{ id: pastSess[0].id, title: '다른 연도' }])]);
+ok(r.err?.includes('연도의 차시가 아닙니다'), '다른 연도의 차시를 섞을 수 없음');
+r = await as(ST, `select update_sessions_bulk($1, $2::jsonb)`, [curYear - 1, JSON.stringify(pastSess.map((s) => ({ id: s.id, title: '고침', held_on: '', description: '' })))]);
+ok(r.err?.includes('관리자 권한'), '지난 연도 일괄 편집은 운영진도 불가');
+const pastAudit = await cnt(`select 1 from audit_logs where action = 'session.updated_past'`);
+r = await as(AD, `select update_sessions_bulk($1, $2::jsonb) n`, [curYear - 1, JSON.stringify(pastSess.slice(0, 3).map((s) => ({ id: s.id, title: `옛 ${s.no}차시`, held_on: '', description: '기록' })))]);
+ok(!r.err && r.rows[0].n === 3, '관리자는 지난 연도 차시도 일괄 편집');
+ok(await cnt(`select 1 from audit_logs where action = 'session.updated_past'`) === pastAudit + 3, '지난 연도 일괄 편집은 바뀐 차시마다 감사 기록');
+r = await as(AD, `select update_sessions_bulk($1, '[]'::jsonb)`, [curYear]);
+ok(r.err?.includes('수정할 차시'), '빈 목록은 거절');
+
+
+
+// 38. 3단계 데이터가 있는 DB 에 schema.sql 을 다시 적용해도 그대로
+{
+  await as(AD, `select delete_team($1, '재적용 시험')`, [DT3.id]);
+  const before = [await cnt(`select 1 from featured_items`), await cnt(`select 1 from team_projects where deleted_at is not null`), await cnt(`select 1 from membership_history`),
+    await cnt(`select 1 from account_invites`), await cnt(`select 1 from storage.objects`), await cnt(`select 1 from audit_logs`)];
+  let e4 = null;
+  try { await db.exec(readFileSync(schemaPath, 'utf8')); } catch (e) { e4 = e.message; }
+  ok(!e4, '3단계 데이터가 있는 DB 에 schema.sql 재적용 (' + (e4 || '성공') + ')');
+  const after = [await cnt(`select 1 from featured_items`), await cnt(`select 1 from team_projects where deleted_at is not null`), await cnt(`select 1 from membership_history`),
+    await cnt(`select 1 from account_invites`), await cnt(`select 1 from storage.objects`), await cnt(`select 1 from audit_logs`)];
+  ok(J(before) === J(after), '재적용해도 우수 작업물·삭제된 팀·명단·사전 등록·Storage·감사 기록이 그대로');
+  ok(await seeCnt(TX, 'team_projects', `id = '${DT3.id}'`) === 0 && await seeCnt(AD, 'team_projects', `id = '${DT3.id}'`) === 1, '재적용해도 삭제된 팀은 여전히 관리자에게만 보임');
+  ok(await cnt(`select 1 from pg_policies where schemaname = 'storage' and policyname like 'pop_files_%'`) === 3, '재적용해도 Storage 정책 3개');
+  ok(await cnt(`select 1 from pg_trigger where tgname = 'user_roles_sync_snapshot'`) === 1, '직책 기록 동기화 트리거는 하나만');
+}
 }
 
 // 23. 기존 데이터 이전 (옛 구조 DB 에 새 schema.sql 적용)
@@ -1315,6 +1702,19 @@ ok(!!r.err, '승인 대기 회원은 팀을 만들 수 없음');
   ok((await q2(`select count(*)::int n from public.academic_years`))[0].n === 1, '재실행해도 연도는 한 행');
 }
 
+
+// 39. 클라이언트 CSV 파서 (js/util.js 의 parseRosterCsv)
+{
+  const vm = await import('node:vm');
+  const ctx = vm.createContext({});
+  vm.runInContext(readFileSync(process.argv[2] ? process.argv[2].replace(/supabase[\/]schema.sql$/, 'js/util.js') : new URL('../js/util.js', import.meta.url), 'utf8') + ';this.parse = parseRosterCsv; this.raw = parseCsv;', ctx);
+  const a = ctx.parse('﻿이름,기수,학년,이메일,회원번호,직책\r\n"홍, 길동",4,2,A@x.kr,,"부장,""x"""\r\n김,5,1,b@x.kr,POP-0002,\r\n\r\n');
+  ok(a.length === 2 && a[0].name === '홍, 길동' && a[0].note === '부장,"x"' && a[1].member_no === 'POP-0002', 'CSV: BOM·CRLF·따옴표·쉼표 칸 처리');
+  ok(ctx.raw('a,"x\ny"\n').length === 1 && ctx.raw('a,"x\ny"\n')[0][1] === 'x\ny', 'CSV: 따옴표 안 줄바꿈');
+  let e = ''; try { ctx.parse('기수,학년\n1,2'); } catch (x) { e = x.message; }
+  ok(e.includes('이름'), 'CSV: 이름 열이 없으면 오류');
+  ok(ctx.parse('이름,이메일\n가,g@x.kr')[0].generation === undefined, 'CSV: 없는 열은 비워 둠');
+}
 
 console.log(`\n통과 ${pass} / 실패 ${failN}`);
 process.exit(failN ? 1 : 0);

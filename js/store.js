@@ -29,7 +29,7 @@ function ensureV2Tables(db) {
 }
 /** [2단계] 팀 프로젝트·게시판·파일 표를 빈 상태로 채운다 (기존 브라우저 데이터는 지우지 않는다) */
 const V3_TABLES = ['teams', 'teamMembers', 'teamFiles', 'teamVersions', 'teamNotes', 'teamCredits', 'teamCreditHistory', 'teamSessions', 'teamFinal',
-  'posts', 'postSessions', 'postFiles', 'postComments', 'postReactions'];
+  'posts', 'postSessions', 'postFiles', 'postComments', 'postReactions', 'featured'];
 function ensureV3Tables(db) {
   for (const k of V3_TABLES) if (!Array.isArray(db[k])) db[k] = [];
   if (!db.blobs || typeof db.blobs !== 'object') db.blobs = {};   // 데모 모드의 파일 내용(data URL). 서버 모드에서는 Supabase Storage 를 쓴다.
@@ -49,7 +49,7 @@ const FileStore = {
   async put(path, file) {
     if (file.size > DEMO_FILE_LIMIT) throw new ApiError(`데모 모드에서는 파일을 ${fmtSize(DEMO_FILE_LIMIT)}까지만 올릴 수 있습니다.`);
     const dataUrl = await readAsDataUrl(file);
-    Store.db.blobs[path] = { dataUrl, size: file.size, mime: file.type || '' };
+    Store.db.blobs[path] = { dataUrl, size: file.size, mime: file.type || '', at: new Date().toISOString() };
     Store.save();
     return { size: file.size, mime: file.type || '' };
   },
@@ -161,6 +161,7 @@ const Api = (() => {
       if (inv) {
         // 사전 등록된 이메일: 새 회원을 만들지 않고 기존 회원에 연결 (이름이 같다는 이유로는 합치지 않는다)
         u = find('users', inv.memberId);
+        if (!u.email) u.email = email;   // 명단 가져오기로 만든 회원은 처음 로그인할 때 이메일이 채워진다
         D().accounts.push({ authId: uid('au'), memberId: u.id, email, status: 'active', linkedAt: now(), linkedBy: inv.createdBy });
         D().invites = D().invites.filter((i) => i !== inv);
         D().auditLogs.push({ id: uid('a'), at: now(), actor: null, action: 'account.linked', target: u.id, detail: { email, via: 'invite' } });
@@ -623,6 +624,11 @@ const Api = (() => {
 
   /* ---------- 직책 (복수 보유) ---------- */
   const SINGLE_HOLDER = ['president', 'vice'];
+  /** 직책이 바뀌면 현재 연도 명단의 직책 기록도 맞춘다 (서버의 user_roles_sync_snapshot 트리거와 같은 일) */
+  function syncAllRoles() {
+    const y = operatingYear();
+    D().membership.filter((m) => m.year === y).forEach((m) => { const u = find('users', m.memberId); if (u) m.roles = [...(u.roles || [])].sort(); });
+  }
   function holdersOf(code) { return D().users.filter((x) => (x.roles || []).includes(code) && x.status === 'active'); }
   /** 직책 임명. 부장·차장은 한 명(새 보유자를 정하면 기존 보유자는 자동으로 물러남), 관리자·서버 관리자는 여러 명 */
   function appointRole(id, role) {
@@ -641,7 +647,7 @@ const Api = (() => {
         notify(x.id, `${roleLabel(role)} 직책이 ${t.name} 님에게 넘어갔습니다.`, '#/me');
       });
     }
-    t.roles.push(role);
+    t.roles.push(role); syncAllRoles();
     audit('role.appointed', id, { role });
     notify(id, `${roleLabel(role)} 직책이 부여되었습니다.`, '#/me');
     Store.save();
@@ -655,7 +661,7 @@ const Api = (() => {
     const t = find('users', id) || fail('회원이 없습니다.');
     if (!t.roles.includes(role)) fail('그 직책을 가진 회원이 아닙니다.');
     if (role === 'admin' && !D().users.some((x) => x.status === 'active' && (x.roles.includes('owner') || (x.roles.includes('admin') && x.id !== id)))) fail('마지막 관리자는 해임할 수 없습니다.');
-    t.roles = t.roles.filter((r) => r !== role);
+    t.roles = t.roles.filter((r) => r !== role); syncAllRoles();
     audit('role.revoked', id, { role, reason: 'revoke' });
     notify(id, `${roleLabel(role)} 직책이 해임되었습니다.`, '#/me');
     Store.save();
@@ -688,7 +694,7 @@ const Api = (() => {
     ['owner', 'admin'].forEach((r) => { if (!cur.roles.includes(r)) cur.roles.push(r); });
     from.roles = from.roles.filter((r) => r !== 'owner');
     if (!from.roles.includes('admin')) from.roles.push('admin');   // 이전 최고 관리자는 관리자로 남는다
-    tr.status = 'accepted'; tr.decidedAt = now();
+    tr.status = 'accepted'; tr.decidedAt = now(); syncAllRoles();
     audit('owner.transferred', cur.id, { transfer: id, from: from.id });
     notify(from.id, `${cur.name} 님이 최고 관리자 이양을 수락했습니다. 이제 관리자입니다.`, '#/admin?tab=roles');
     Store.save();
@@ -869,7 +875,7 @@ const Api = (() => {
   const isTeamLeader = (t, u = me()) => !!u && !!t && t.leader === u.id;
   const isReaderUser = (u) => !!u && (u.status === 'active' || u.status === 'graduated');
   /** 비공개 작업 공간(파일·메모)을 볼 수 있는가: 팀원 또는 운영진 */
-  const canViewTeam = (t, u = me()) => !!t && isReaderUser(u) && (isTeamMember(t.id, u) || isStaff(u));
+  const canViewTeam = (t, u = me()) => !!t && isReaderUser(u) && (isTeamMember(t.id, u) || isStaff(u)) && (isAdmin(u) || !t.deletedAt);
   const teamPublished = (t) => !!t && !!t.publishedAt && !t.deletedAt;
   const notifyTeam = (tid, text) => D().teamMembers.filter((m) => m.teamId === tid && m.status === 'active').forEach((m) => notify(m.memberId, text, `#/team/${tid}`));
   function teamForWrite(id, action) {
@@ -904,14 +910,14 @@ const Api = (() => {
 
   function teamList({ scope = 'all', status = '', year = '' } = {}) {
     const u = requireReader();
-    return D().teams.filter((t) => !t.deletedAt || isStaff(u))
+    return D().teams.filter((t) => !t.deletedAt || isAdmin(u))   // 삭제된 팀은 관리자에게만 보인다
       .filter((t) => scope !== 'mine' || D().teamMembers.some((m) => m.teamId === t.id && m.memberId === u.id && m.status !== 'left'))
       .filter((t) => !status || t.status === status).filter((t) => !year || String(t.year) === String(year))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
-  function getTeam(id) { requireReader(); const t = team(id); if (!t || (t.deletedAt && !isStaff(me()))) fail('팀 프로젝트를 찾을 수 없습니다.'); return t; }
+  function getTeam(id) { requireReader(); const t = team(id); if (!t || (t.deletedAt && !isAdmin(me()))) fail('팀 프로젝트를 찾을 수 없습니다.'); return t; }
   function teamMembersOf(id) {
-    const u = requireReader(); const t = team(id); if (!t) return [];
+    const u = requireReader(); const t = team(id); if (!t || (t.deletedAt && !isAdmin(u))) return [];
     return D().teamMembers.filter((m) => m.teamId === id && (m.status === 'active' || m.memberId === u.id || isTeamLeader(t, u) || isStaff(u)))
       .filter((m) => m.status !== 'left' || isStaff(u) || m.memberId === u.id)
       .sort((a, b) => (a.memberId === t.leader ? -1 : b.memberId === t.leader ? 1 : String(a.joinedAt || a.invitedAt).localeCompare(String(b.joinedAt || b.invitedAt))));
@@ -945,7 +951,7 @@ const Api = (() => {
   const sessionsOfTeam = (id) => { requireReader(); return D().teamSessions.filter((x) => x.teamId === id).map((x) => D().sessions.find((s) => s.id === x.sessionId)).filter(Boolean).sort((a, b) => b.year - a.year || a.no - b.no); };
   function teamsOfSession(sessionId) {
     requireReader();
-    return D().teamSessions.filter((x) => x.sessionId === sessionId).map((x) => team(x.teamId)).filter((t) => t && !t.deletedAt).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    return D().teamSessions.filter((x) => x.sessionId === sessionId).map((x) => team(x.teamId)).filter((t) => t && (!t.deletedAt || isAdmin(me()))).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
   function myInvites() {
     const u = me(); if (!u) return [];
@@ -956,8 +962,8 @@ const Api = (() => {
     const member = isTeamMember(t.id, u), leader = isTeamLeader(t, u), staff = isStaff(u), admin = isAdmin(u);
     const past = t.year < operatingYear();
     const active = !!u && u.status === 'active';
-    const locked = (past && !admin) || !active;
-    return { member, leader, staff, admin, past, locked, view: canViewTeam(t, u), published: teamPublished(t),
+    const locked = (past && !admin) || !active || !!t.deletedAt;
+    return { member, leader, staff, admin, past, locked, deleted: !!t.deletedAt, view: canViewTeam(t, u), published: teamPublished(t),
       canWork: member && active && !locked && !['published', 'archived'].includes(t.status) };
   }
 
@@ -966,7 +972,7 @@ const Api = (() => {
     name = String(name || '').trim(); if (!name) fail('팀 이름을 입력하세요.');
     checkLen(name, 60, '팀 이름'); checkLen(description, 2000, '설명'); checkLen(goal, 1000, '목표');
     const t = { id: uid('t'), name, description: String(description || '').trim(), goal: String(goal || '').trim(), leader: u.id, year: operatingYear(), coverPath: null,
-      status: 'planning', publishedAt: null, createdAt: now(), updatedAt: now(), deletedAt: null };
+      status: 'planning', publishedAt: null, createdAt: now(), updatedAt: now(), deletedAt: null, deletedBy: null, deleteReason: '' };
     D().teams.push(t);
     D().teamMembers.push({ teamId: t.id, memberId: u.id, roleLabel: '팀장', status: 'active', invitedBy: u.id, invitedAt: now(), joinedAt: now() });
     Store.save(); return t;
@@ -1223,7 +1229,7 @@ const Api = (() => {
   /* ---------- 2단계: 게시판·공지 ---------- */
   const rawPost = (id) => find('posts', id) || null;
   /** 운영진은 전부, 그 외에는 지워지지 않았고 (본인 글이거나 [숨김 아님 + 부원 공개]) */
-  const canReadPost = (p, u = me()) => !!p && isReaderUser(u) && (isStaff(u) || (!p.deletedAt && (p.author === u.id || (!p.hidden && p.visibility === 'members'))));
+  const canReadPost = (p, u = me()) => !!p && isReaderUser(u) && (isAdmin(u) || !p.teamId || !team(p.teamId)?.deletedAt) && (isStaff(u) || (!p.deletedAt && (p.author === u.id || (!p.hidden && p.visibility === 'members'))));
   function getPost(id) { requireReader(); const p = rawPost(id); if (!canReadPost(p)) fail('게시물을 찾을 수 없습니다.'); return p; }
   const cleanTags = (tags) => [...new Set((tags || []).map((t) => String(t).trim().replace(/^#+|#+$/g, '').slice(0, 20)).filter(Boolean))].sort().slice(0, 8);
   const likesOf = (id) => D().postReactions.filter((r) => r.postId === id).length;
@@ -1374,7 +1380,7 @@ const Api = (() => {
   function profile(userId) {
     requireReader();
     find('users', userId) || fail('사용자를 찾을 수 없습니다.');
-    const teams = D().teams.filter((t) => !t.deletedAt && D().teamMembers.some((m) => m.teamId === t.id && m.memberId === userId && m.status === 'active')).sort((a, b) => b.year - a.year || b.createdAt.localeCompare(a.createdAt));
+    const teams = D().teams.filter((t) => (!t.deletedAt || isAdmin(me())) && D().teamMembers.some((m) => m.teamId === t.id && m.memberId === userId && m.status === 'active')).sort((a, b) => b.year - a.year || b.createdAt.localeCompare(a.createdAt));
     const credits = D().teamCredits.filter((c) => c.memberId === userId && c.status === 'confirmed').map((c) => ({ credit: c, team: team(c.teamId) })).filter((x) => teamPublished(x.team));
     const posts = D().posts.filter((p) => p.author === userId && !p.deletedAt && canReadPost(p)).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     const history = D().membership.filter((m) => m.memberId === userId).sort((a, b) => b.year - a.year);
@@ -1382,6 +1388,241 @@ const Api = (() => {
   }
   function activeMembers() { requireReader(); return D().users.filter((x) => x.status === 'active').sort((a, b) => a.name.localeCompare(b.name)); }
   const counts2 = () => ({ teams: D().teams.filter((t) => !t.deletedAt).length, posts: D().posts.filter((p) => !p.deletedAt).length, files: D().teamVersions.length });
+
+
+  /* ===================== 3단계 (서버 schema.sql 의 v2.2 함수와 같은 규칙) ===================== */
+  /* ---------- 팀 삭제·복구: 관리자 전용 소프트 삭제 ---------- */
+  function deleteTeam(id, reason = '') {
+    const u = requireAdmin(); const t = team(id) || fail('팀 프로젝트를 찾을 수 없습니다.');
+    if (t.deletedAt) fail('이미 삭제된 팀입니다.');
+    checkLen(reason, 500, '삭제 사유');
+    const at = now(); let posts = 0;
+    Object.assign(t, { deletedAt: at, deletedBy: u.id, deleteReason: String(reason || '').trim(), updatedAt: at });
+    D().posts.filter((p) => p.teamId === id && !p.deletedAt).forEach((p) => { p.deletedAt = at; posts++; });   // 연결된 동아리 게시물도 함께(복구 때 같은 시각의 것만 되살림)
+    audit('team.deleted', t.leader, { team: id, name: t.name, year: t.year, reason: t.deleteReason, posts });
+    D().teamMembers.filter((m) => m.teamId === id && ['active', 'invited'].includes(m.status)).forEach((m) => notify(m.memberId, `팀 프로젝트 「${t.name}」이(가) 관리자에 의해 삭제되었습니다.`, '#/teams'));
+    Store.save();
+  }
+  function restoreTeam(id) {
+    requireAdmin(); const t = team(id) || fail('팀 프로젝트를 찾을 수 없습니다.');
+    if (!t.deletedAt) fail('삭제된 팀이 아닙니다.');
+    let posts = 0;
+    D().posts.filter((p) => p.teamId === id && p.deletedAt === t.deletedAt).forEach((p) => { p.deletedAt = null; posts++; });
+    Object.assign(t, { deletedAt: null, deletedBy: null, deleteReason: '', updatedAt: now() });
+    audit('team.restored', t.leader, { team: id, name: t.name, year: t.year, posts });
+    D().teamMembers.filter((m) => m.teamId === id && ['active', 'invited'].includes(m.status)).forEach((m) => notify(m.memberId, `팀 프로젝트 「${t.name}」이(가) 복구되었습니다.`, `#/team/${id}`));
+    Store.save();
+  }
+  function deletedTeams() { requireAdmin(); return D().teams.filter((t) => t.deletedAt).sort((a, b) => b.deletedAt.localeCompare(a.deletedAt)); }
+
+  /* ---------- 명예의 전당: 우수 작업물 ---------- */
+  const featuredVisible = (f) => {
+    if (f.kind === 'team') { const t = team(f.itemId); return !!t && (!t.deletedAt || isAdmin(me())); }
+    if (f.kind === 'post') return canReadPost(rawPost(f.itemId));
+    if (f.kind === 'project') { const p = rawProject(f.itemId); return !!p && canSee(p); }
+    return false;
+  };
+  function featuredList() { requireReader(); return (D().featured || []).filter(featuredVisible); }
+  function featuredYearOf(kind, id) {
+    if (kind === 'team') { const t = team(id); if (!t || t.deletedAt) fail('팀 프로젝트를 찾을 수 없습니다.'); if (!t.publishedAt) fail('게시 완료된 팀 프로젝트만 우수 작업물로 올릴 수 있습니다.'); return { year: t.year, title: t.name }; }
+    if (kind === 'post') {
+      const p = rawPost(id); if (!p || p.deletedAt || p.hidden || p.visibility !== 'members') fail('게시물을 찾을 수 없습니다.');
+      if (p.board === 'notice') fail('공지는 우수 작업물로 올릴 수 없습니다.');
+      return { year: p.year, title: p.title };
+    }
+    if (kind === 'project') { const p = rawProject(id); if (!p || p.deleted || p.hidden) fail('프로젝트를 찾을 수 없습니다.'); return { year: p.year ?? operatingYear(new Date(p.createdAt).getTime()), title: p.title }; }
+    fail('우수 작업물로 올릴 수 없는 종류입니다.');
+  }
+  function featureItem(kind, id, note = '') {
+    const u = requireActive(); checkLen(note, 200, '메모');
+    const { year, title } = featuredYearOf(kind, id);
+    if (year !== operatingYear()) requireAdmin(); else requireStaff();
+    const row = D().featured.find((f) => f.kind === kind && f.itemId === id);
+    const data = { kind, itemId: id, year, note: String(note || '').trim(), featuredBy: u.id, featuredAt: now() };
+    if (row) Object.assign(row, data); else D().featured.push(data);
+    if (year !== operatingYear()) audit('hall.featured_past', null, { kind, item: id, year, title });
+    Store.save();
+  }
+  function unfeatureItem(kind, id) {
+    requireActive();
+    const f = D().featured.find((x) => x.kind === kind && x.itemId === id) || fail('우수 작업물로 지정되어 있지 않습니다.');
+    if (f.year !== operatingYear()) requireAdmin(); else requireStaff();
+    D().featured = D().featured.filter((x) => x !== f);
+    if (f.year !== operatingYear()) audit('hall.unfeatured_past', null, { kind, item: id, year: f.year });
+    Store.save();
+  }
+  /** 명예의 전당 한 해 분: 임원(그 해 직책 기록), 기수별 회원, 게시된 팀 프로젝트, 우수 작업물, 차시별 기록 */
+  function hall(yearIn) {
+    requireReader(); const year = Number(yearIn);
+    if (!D().years.some((y) => y.year === year)) fail('없는 운영 연도입니다.');
+    const rows = D().membership.filter((m) => m.year === year);
+    const userOf = (id) => find('users', id);
+    const officers = ['owner', 'admin', 'president', 'vice', 'server'].map((code) => ({ code, label: roleLabel(code),
+      members: rows.filter((m) => (m.roles || []).includes(code)).map((m) => userOf(m.memberId)).filter(Boolean) })).filter((o) => o.members.length);
+    const groups = new Map();
+    rows.forEach((m) => {
+      const u = userOf(m.memberId); if (!u || u.status === 'pending') return;
+      const g = m.generation ?? null; if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push({ user: u, grade: m.grade ?? null, status: m.status, roles: m.roles || [] });
+    });
+    const generations = [...groups.entries()].sort(([a], [b]) => (a == null) - (b == null) || b - a)
+      .map(([generation, members]) => ({ generation, members: members.sort((a, b) => a.user.name.localeCompare(b.user.name)) }));
+    const teams = D().teams.filter((t) => t.year === year && teamPublished(t)).sort((a, b) => String(a.publishedAt).localeCompare(String(b.publishedAt)));
+    const featured = featuredList().filter((f) => f.year === year).map((f) => {
+      if (f.kind === 'team') { const t = team(f.itemId); return { f, title: t.name, link: `#/team/${t.id}`, label: '팀 프로젝트', sub: `팀장 ${user(t.leader).name}` }; }
+      if (f.kind === 'post') { const p = rawPost(f.itemId); return { f, title: p.title, link: `#/post/${p.id}`, label: p.board === 'free' ? '자유 게시물' : '동아리 게시물', sub: user(p.author).name }; }
+      const p = rawProject(f.itemId); return { f, title: p.title, link: `#/p/${p.id}`, label: '코드 프로젝트', sub: user(p.ownerId).name };
+    }).sort((a, b) => b.f.featuredAt.localeCompare(a.f.featuredAt));
+    const sessions = sessionsOf(year).map((s) => ({ session: s, projects: projectsOfSession(s.id).length, teams: teamsOfSession(s.id).filter((t) => !t.deletedAt).length, posts: postsOfSession(s.id).length }));
+    return { year, current: year === operatingYear(), officers, generations, members: rows.length, teams, featured, sessions,
+      projects: D().projects.filter((p) => !p.deleted && canSee(p) && p.year === year).length };
+  }
+
+  /* ---------- 명단 가져오기(CSV) ---------- */
+  function classifyRoster(year, rows) {
+    const domain = D().settings.domain.toLowerCase();
+    if (!Array.isArray(rows) || !rows.length) fail('가져올 명단이 없습니다.');
+    if (rows.length > 500) fail('한 번에 500행까지 가져올 수 있습니다.');
+    if (!D().years.some((y) => y.year === Number(year))) fail(`${year}년 운영 연도가 없습니다.`);
+    const seenEmails = [], seenNos = [], seenMembers = [];
+    const memberByEmail = (em) => [...new Set([
+      ...D().accounts.filter((a) => (a.email || '').toLowerCase() === em).map((a) => a.memberId),
+      ...D().users.filter((x) => (x.email || '').toLowerCase() === em).map((x) => x.id),
+      ...D().invites.filter((i) => i.email.toLowerCase() === em).map((i) => i.memberId)])];
+    return rows.map((e, i) => {
+      const name = String(e.name ?? '').trim(), email = String(e.email ?? '').trim().toLowerCase(), no = String(e.member_no ?? '').trim().toUpperCase();
+      const genT = String(e.generation ?? '').trim(), gradeT = String(e.grade ?? '').trim(), note = String(e.note ?? '').trim().slice(0, 100);
+      const out = { idx: i + 1, name, generation: null, grade: null, email, member_no: no, note, status: null, reason: null, member_id: null, member_name: null, invite: false, activate: false };
+      const bad = (reason) => { out.status = 'error'; out.reason = reason; return out; };
+      if (!name) return bad('이름이 비어 있습니다.');
+      if (name.length > 50) return bad('이름이 50자를 넘습니다.');
+      if (!no && !email) return bad('이메일 또는 회원번호가 필요합니다.');
+      if (genT && !/^[0-9]{1,3}$/.test(genT)) return bad('기수가 올바르지 않습니다. (1 이상의 숫자)');
+      if (gradeT && !/^[0-9]$/.test(gradeT)) return bad('학년이 올바르지 않습니다. (1~6)');
+      if (no && !/^POP-[0-9]{1,8}$/.test(no)) return bad('회원번호 형식이 올바르지 않습니다. (예: POP-0001)');
+      if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return bad('이메일 형식이 올바르지 않습니다.');
+      if (email && !email.endsWith('@' + domain)) return bad(`학교 계정(@${domain})이 아닙니다.`);
+      if (genT) { out.generation = Number(genT); if (out.generation < 1) return bad('기수는 1 이상이어야 합니다.'); }
+      if (gradeT) { out.grade = Number(gradeT); if (out.grade < 1 || out.grade > 6) return bad('학년은 1~6 사이여야 합니다.'); }
+      if ((email && seenEmails.includes(email)) || (no && seenNos.includes(no))) { out.status = 'dup'; out.reason = '파일 안에 같은 이메일 또는 회원번호가 앞에 이미 있습니다.'; return out; }
+      let a = null;
+      if (no) { a = D().users.find((x) => x.memberNo === no) || null; if (!a) return bad('그런 회원번호가 없습니다.'); }
+      const b = email ? memberByEmail(email) : [];
+      if (b.length > 1) { out.status = 'conflict'; out.reason = '이 이메일이 여러 회원에 연결되어 있습니다.'; return out; }
+      if (a && b.length === 1 && b[0] !== a.id) { out.status = 'conflict'; out.reason = '회원번호와 이메일이 서로 다른 회원을 가리킵니다.'; return out; }
+      const memberId = a ? a.id : b[0] || null;
+      if (!memberId) out.status = 'new';
+      else if (seenMembers.includes(memberId)) { out.status = 'dup'; out.reason = '파일 안에서 같은 회원이 앞에 이미 있습니다.'; return out; }
+      else {
+        const m = find('users', memberId);
+        Object.assign(out, { status: 'existing', member_id: memberId, member_name: m.name, invite: !!email && b.length === 0, activate: m.status === 'pending' });
+      }
+      if (email) seenEmails.push(email);
+      if (no) seenNos.push(no);
+      if (memberId) seenMembers.push(memberId);
+      return out;
+    });
+  }
+  const rosterCounts = (rows) => rows.reduce((c, r) => { c[r.status] = (c[r.status] || 0) + 1; return c; }, {});
+  function previewRoster(year, rows) { requireAdmin(); const out = classifyRoster(Number(year), rows); return { year: Number(year), rows: out, counts: rosterCounts(out) }; }
+  function importRoster(yearIn, rows) {
+    const u = requireAdmin(); const year = Number(yearIn); const out = classifyRoster(year, rows);
+    const cur = operatingYear(); let created = 0, updated = 0, skipped = 0, invites = 0, activated = 0; const activatedIds = [];
+    for (const r of out) {
+      if (!['new', 'existing'].includes(r.status)) { skipped++; continue; }
+      let m;
+      if (r.status === 'new') {
+        const max = Math.max(0, ...D().users.map((x) => Number(String(x.memberNo).replace(/\D/g, '')) || 0));
+        m = { id: uid('u'), name: r.name, email: '', role: 'member', roles: [], memberNo: 'POP-' + String(max + 1).padStart(4, '0'), status: 'active', generation: r.generation, createdAt: now() };
+        D().users.push(m);
+        D().invites.push({ email: r.email, memberId: m.id, createdBy: u.id, createdAt: now() });
+        created++; invites++;
+      } else {
+        m = find('users', r.member_id);
+        if (r.invite && r.email && !D().invites.some((i) => i.email === r.email)) { D().invites.push({ email: r.email, memberId: m.id, createdBy: u.id, createdAt: now() }); invites++; }
+        if (r.activate) { m.status = 'active'; activatedIds.push(m.id); activated++; notify(m.id, '가입이 승인되었습니다. 환영합니다!', '#/'); }
+        if (r.generation != null && m.generation == null) m.generation = r.generation;
+        updated++;
+      }
+      const row = D().membership.find((x) => x.memberId === m.id && x.year === year);
+      if (row) {
+        if (r.generation != null) row.generation = r.generation;
+        if (r.grade != null) row.grade = r.grade;
+        if (r.note) row.note = r.note;
+      } else D().membership.push({ memberId: m.id, year, generation: r.generation, grade: r.grade, roles: year === cur ? [...m.roles] : [], status: m.status, note: r.note || '' });
+    }
+    audit('roster.imported', null, { year, created, updated, skipped, invites, activated, activated_members: activatedIds, rows: out.length });
+    Store.save();
+    return { year, created, updated, skipped, invites, activated, rows: out };
+  }
+
+  /* ---------- 차시 일괄 편집 ---------- */
+  function updateSessionsBulk(yearIn, items) {
+    requireActive(); const year = Number(yearIn); const past = isPastYear(year);
+    if (past) requireAdmin(); else requireStaff();
+    if (!Array.isArray(items) || !items.length) fail('수정할 차시가 없습니다.');
+    if (items.length > 10) fail('차시는 한 번에 10개까지 고칠 수 있습니다.');
+    const seen = new Set(); const todo = [];
+    for (const e of items) {
+      const s = D().sessions.find((x) => x.id === e.id);
+      if (!s || s.year !== year) fail(`${year} 연도의 차시가 아닙니다.`);
+      if (seen.has(s.id)) fail('같은 차시가 두 번 들어 있습니다.');
+      seen.add(s.id);
+      const title = String(e.title || '').trim(); if (!title) fail(`${s.no}차시의 제목을 입력하세요.`);
+      checkLen(title, 100, '차시 제목'); checkLen(e.description, 1000, '차시 설명');
+      const heldOn = String(e.heldOn || '').trim() || null;
+      if (heldOn && (!/^\d{4}-\d{2}-\d{2}$/.test(heldOn) || Number.isNaN(Date.parse(heldOn)))) fail(`${s.no}차시의 날짜 형식이 올바르지 않습니다.`);
+      todo.push({ s, title, heldOn, description: String(e.description || '').trim() });
+    }
+    let n = 0;
+    todo.forEach(({ s, title, heldOn, description }) => {
+      if (s.title !== title || (s.heldOn || null) !== heldOn || s.description !== description) {
+        Object.assign(s, { title, heldOn, description }); n++;
+        if (past) audit('session.updated_past', null, { session: s.id, year: s.year, no: s.no, title });
+      }
+    });
+    Store.save();
+    return n;
+  }
+
+  /* ---------- 저장 공간 관리 (데모: 브라우저에 저장된 파일 기준) ---------- */
+  const STORAGE_LIMIT = 1073741824;
+  const referencedPaths = () => new Set([...D().teamVersions.map((v) => v.path), ...D().postFiles.map((f) => f.path),
+    ...D().posts.map((p) => p.coverPath).filter(Boolean), ...D().teams.map((t) => t.coverPath).filter(Boolean)]);
+  function storageLinked(path) {
+    const v = D().teamVersions.find((x) => x.path === path);
+    if (v) { const f = D().teamFiles.find((x) => x.id === v.fileId); const t = f && team(f.teamId); return `팀 파일 · ${t ? t.name : ''} / ${f ? f.name : ''}`; }
+    const pf = D().postFiles.find((x) => x.path === path); if (pf) return `게시물 첨부 · ${rawPost(pf.postId)?.title || ''}`;
+    const po = D().posts.find((x) => x.coverPath === path); if (po) return `게시물 대표 이미지 · ${po.title}`;
+    const t = D().teams.find((x) => x.coverPath === path); if (t) return `팀 대표 이미지 · ${t.name}`;
+    return null;
+  }
+  function storageUsage() {
+    requireActive(); const u = me();
+    if (!canServerDetail(u)) fail('저장 공간 상태를 볼 권한이 없습니다.');
+    const admin = isAdmin(u); const list = Object.entries(D().blobs || {}).map(([path, b]) => ({ path, size: b.size || 0, createdAt: b.at || null }));
+    const ref = referencedPaths();
+    const total = list.reduce((n, x) => n + x.size, 0);
+    const out = { available: true, limitBytes: STORAGE_LIMIT, totalBytes: total, totalCount: list.length, byPrefix: null, largest: null, orphans: null, orphanCount: null, orphanBytes: null };
+    if (admin) {
+      const by = new Map(); list.forEach((x) => { const k = x.path.split('/')[0]; const c = by.get(k) || { prefix: k, bytes: 0, count: 0 }; c.bytes += x.size; c.count++; by.set(k, c); });
+      out.byPrefix = [...by.values()].sort((a, b) => b.bytes - a.bytes);
+      out.largest = [...list].sort((a, b) => b.size - a.size || a.path.localeCompare(b.path)).slice(0, 20).map((x) => ({ ...x, linked: storageLinked(x.path) }));
+      const orph = list.filter((x) => !ref.has(x.path));
+      out.orphans = orph.slice(0, 200).map((x) => ({ ...x, deletable: true }));   // 데모에서는 24시간 조건 없이 정리할 수 있다
+      out.orphanCount = orph.length; out.orphanBytes = orph.reduce((n, x) => n + x.size, 0);
+    }
+    return out;
+  }
+  function cleanupOrphans(paths) {
+    requireAdmin();
+    if (!Array.isArray(paths) || !paths.length) fail('정리한 파일 목록이 비어 있습니다.');
+    if (paths.length > 200) fail('한 번에 200개까지 기록할 수 있습니다.');
+    const ref = referencedPaths(); let removed = 0;
+    for (const p of paths) if (D().blobs[p] && !ref.has(p)) { delete D().blobs[p]; removed++; }
+    audit('storage.orphans_cleaned', null, { requested: paths.length, removed, sample: paths.slice(0, 10) });
+    Store.save(); return removed;
+  }
 
   /* ---------- 서버 상태 (데모 모드에는 서버가 없다) ---------- */
   function ping() { return { ok: true, ms: 0, now: now(), lastPing: now(), demo: true }; }
@@ -1407,5 +1648,7 @@ const Api = (() => {
     // 2단계: 게시판
     rawPost, canReadPost, getPost, listPosts, sessionsOfPost, postsOfSession, postFilesOf, postCommentsOf, postLikedByMe, likesOf, createPost, updatePost, deletePost,
     setPostHidden, setPostPinned, registerPostFile, removePostFile, addPostComment, deletePostComment, togglePostReaction, reportPost, profile, counts2, activeMembers,
+    // 3단계
+    deleteTeam, restoreTeam, deletedTeams, featuredList, featureItem, unfeatureItem, hall, previewRoster, importRoster, updateSessionsBulk, storageUsage, cleanupOrphans,
   };
 })();

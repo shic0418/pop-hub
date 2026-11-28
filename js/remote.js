@@ -27,12 +27,24 @@ const Remote = (() => {
     if (error) throw new ApiError(cleanError(error.message));
     return data;
   }
-  /** PostgREST는 한 번에 최대 1000행이라 나눠서 받는다 */
-  async function fetchAll(table, columns = '*', apply = (q) => q, orderBy = 'id') {
+  /** 표마다 행을 하나로 정하는 정렬 열(기본키). 기본키가 여러 열이면 전부 정렬에 넣어야 페이지 사이에 행이 겹치거나 빠지지 않는다. */
+  const ORDER = {
+    member_emails: ['user_id'], user_accounts: ['auth_id'], account_invites: ['email'], private_settings: ['id'],
+    user_roles: ['member_id', 'role'], role_permissions: ['role', 'perm'], academic_years: ['year'],
+    membership_history: ['member_id', 'year'], project_sessions: ['project_id', 'session_id'],
+    team_members: ['team_id', 'member_id'], team_credits: ['team_id', 'member_id'], team_project_sessions: ['team_id', 'session_id'],
+    team_final_files: ['team_id', 'file_version_id'], post_sessions: ['post_id', 'session_id'], post_reactions: ['post_id', 'member_id', 'kind'],
+    featured_items: ['kind', 'item_id'],
+  };
+  /** PostgREST는 한 번에 최대 1000행이라 나눠서 받는다. 정렬은 표의 기본키 전체(ORDER)로 항상 정해 둔다. */
+  async function fetchAll(table, columns = '*', apply = (q) => q, orderBy) {
     const out = []; const size = 1000;
+    const cols = [].concat(orderBy || ORDER[table] || ['id']);
     for (let from = 0; ; from += size) {
-      // 정렬이 없으면 페이지 사이에 행이 겹치거나 빠질 수 있다
-      const { data, error } = await apply(client.from(table).select(columns)).order(orderBy).range(from, from + size - 1);
+      // 정렬이 없거나 유일하지 않으면 페이지 사이에 행이 겹치거나 빠질 수 있다
+      let q = apply(client.from(table).select(columns));
+      for (const c of cols) q = q.order(c);
+      const { data, error } = await q.range(from, from + size - 1);
       if (error) throw new ApiError(cleanError(error.message));
       out.push(...data);
       if (data.length < size) return out;
@@ -69,10 +81,10 @@ const Remote = (() => {
   const day = (v) => (v == null ? null : v instanceof Date ? v.toISOString().slice(0, 10) : String(v).slice(0, 10));
   const mapYear = (r) => ({ year: r.year, startsOn: day(r.starts_on), endsOn: day(r.ends_on), status: r.status });
   const mapSession = (r) => ({ id: r.id, year: r.year, no: r.no, title: r.title, heldOn: day(r.held_on), description: r.description });
-  const mapMembership = (r) => ({ memberId: r.member_id, year: r.year, generation: r.generation, grade: r.grade, roles: r.roles || [], status: r.status });
+  const mapMembership = (r) => ({ memberId: r.member_id, year: r.year, generation: r.generation, grade: r.grade, roles: r.roles || [], status: r.status, note: r.note || '' });
   const mapReport = (r) => ({ id: r.id, projectId: r.project_id, postId: r.post_id, reporterId: r.reporter_id, reason: r.reason, status: r.status, action: r.action, resolvedBy: r.resolved_by, resolvedAt: ts(r.resolved_at), createdAt: ts(r.created_at) });
   // [2단계] 팀 프로젝트·게시판
-  const mapTeam = (r) => ({ id: r.id, name: r.name, description: r.description, goal: r.goal, leader: r.leader, year: r.year, coverPath: r.cover_path, status: r.status, publishedAt: ts(r.published_at), createdAt: ts(r.created_at), updatedAt: ts(r.updated_at), deletedAt: ts(r.deleted_at) });
+  const mapTeam = (r) => ({ id: r.id, name: r.name, description: r.description, goal: r.goal, leader: r.leader, year: r.year, coverPath: r.cover_path, status: r.status, publishedAt: ts(r.published_at), createdAt: ts(r.created_at), updatedAt: ts(r.updated_at), deletedAt: ts(r.deleted_at), deletedBy: r.deleted_by || null, deleteReason: r.delete_reason || '' });
   const mapTeamMember = (r) => ({ teamId: r.team_id, memberId: r.member_id, roleLabel: r.role_label, status: r.status, invitedBy: r.invited_by, invitedAt: ts(r.invited_at), joinedAt: ts(r.joined_at) });
   const mapTeamFile = (r) => ({ id: r.id, teamId: r.team_id, name: r.name, createdBy: r.created_by, createdAt: ts(r.created_at) });
   const mapTeamVersion = (r) => ({ id: r.id, fileId: r.file_id, versionNo: r.version_no, origName: r.orig_name, path: r.path, size: Number(r.size), mime: r.mime, note: r.note, uploadedBy: r.uploaded_by, uploadedAt: ts(r.uploaded_at) });
@@ -110,24 +122,24 @@ const Remote = (() => {
     if (uid) {
       const [profiles, emails, priv, projects, skeleton, versionIds, mrs, frs, comments, contribs, notis, reports,
         accounts, invites, userRoles, perms, transfers, audits, years, sessions, membership, projectSessions] = await Promise.all([
-        fetchAll('profiles'), fetchAll('member_emails', '*', undefined, 'user_id'), fetchAll('private_settings'), fetchAll('projects'),
+        fetchAll('profiles'), fetchAll('member_emails'), fetchAll('private_settings'), fetchAll('projects'),
         rpc('tree_skeleton', {}), fetchAll('versions', 'id'),
         fetchAll('merge_requests'), fetchAll('fork_requests'), fetchAll('comments'), fetchAll('contributors'),
         fetchAll('notifications'), fetchAll('reports'),
-        fetchAll('user_accounts', '*', undefined, 'auth_id'), fetchAll('account_invites', '*', undefined, 'email'),
-        fetchAll('user_roles', '*', undefined, 'member_id'), fetchAll('role_permissions', '*', undefined, 'role'),
+        fetchAll('user_accounts'), fetchAll('account_invites'),
+        fetchAll('user_roles'), fetchAll('role_permissions'),
         fetchAll('owner_transfers'),
         // 감사 기록은 관리자에게만 보인다(서버가 걸러 준다). 최근 200건만 받는다.
         client.from('audit_logs').select('*').order('id', { ascending: false }).range(0, 199).then(({ data, error }) => { if (error) throw new ApiError(cleanError(error.message)); return data; }),
-        fetchAll('academic_years', '*', undefined, 'year'), fetchAll('sessions'), fetchAll('membership_history', '*', undefined, 'member_id'),
-        fetchAll('project_sessions', '*', undefined, 'project_id'),
+        fetchAll('academic_years'), fetchAll('sessions'), fetchAll('membership_history'),
+        fetchAll('project_sessions'),
       ]);
       // [2단계] 팀 프로젝트·게시판 표 (볼 수 있는 행만 서버가 걸러 준다)
-      const [teams, tMembers, tFiles, tVers, tNotes, tCredits, tHist, tSess, tFinal, posts, pSess, pFiles, pComments, pReacts] = await Promise.all([
-        fetchAll('team_projects'), fetchAll('team_members', '*', undefined, 'team_id'), fetchAll('team_files'), fetchAll('team_file_versions'), fetchAll('team_notes'),
-        fetchAll('team_credits', '*', undefined, 'team_id'), fetchAll('team_credit_history'), fetchAll('team_project_sessions', '*', undefined, 'team_id'),
-        fetchAll('team_final_files', '*', undefined, 'team_id'), fetchAll('posts'), fetchAll('post_sessions', '*', undefined, 'post_id'),
-        fetchAll('post_files'), fetchAll('post_comments'), fetchAll('post_reactions', '*', undefined, 'post_id'),
+      const [teams, tMembers, tFiles, tVers, tNotes, tCredits, tHist, tSess, tFinal, posts, pSess, pFiles, pComments, pReacts, featured] = await Promise.all([
+        fetchAll('team_projects'), fetchAll('team_members'), fetchAll('team_files'), fetchAll('team_file_versions'), fetchAll('team_notes'),
+        fetchAll('team_credits'), fetchAll('team_credit_history'), fetchAll('team_project_sessions'),
+        fetchAll('team_final_files'), fetchAll('posts'), fetchAll('post_sessions'),
+        fetchAll('post_files'), fetchAll('post_comments'), fetchAll('post_reactions'), fetchAll('featured_items'),
       ]);
       db.teams = teams.map(mapTeam); db.teamMembers = tMembers.map(mapTeamMember); db.teamFiles = tFiles.map(mapTeamFile);
       db.teamVersions = tVers.map(mapTeamVersion); db.teamNotes = tNotes.map(mapTeamNote); db.teamCredits = tCredits.map(mapTeamCredit);
@@ -136,6 +148,7 @@ const Remote = (() => {
       db.posts = posts.map(mapPost); db.postSessions = pSess.map((r) => ({ postId: r.post_id, sessionId: r.session_id }));
       db.postFiles = pFiles.map(mapPostFile); db.postComments = pComments.map(mapPostComment);
       db.postReactions = pReacts.map((r) => ({ postId: r.post_id, memberId: r.member_id }));
+      db.featured = featured.map((r) => ({ kind: r.kind, itemId: r.item_id, year: r.year, note: r.note, featuredBy: r.featured_by, featuredAt: ts(r.featured_at) }));
       const emailOf = new Map(emails.map((e) => [e.user_id, e.email]));
       const rolesOf = new Map();
       for (const r of userRoles) { if (!rolesOf.has(r.member_id)) rolesOf.set(r.member_id, []); rolesOf.get(r.member_id).push(r.role); }
@@ -189,6 +202,8 @@ const Remote = (() => {
 
   /* ---------- 쓰기: Api 함수를 RPC로 교체 ---------- */
   const num = (v) => (v === '' || v == null ? null : Number(v));
+  // 명단 행은 서버가 분류하므로 값 그대로(문자열) 보낸다
+  const rosterRows = (rows) => rows.map((r) => ({ name: r.name ?? '', generation: r.generation ?? '', grade: r.grade ?? '', email: r.email ?? '', member_no: r.member_no ?? '', note: r.note ?? '' }));
   const plainFiles = (files) => files.map((f) => ({ path: f.path, content: f.content }));
   const writes = {
     approveUser: (id, gen) => rpc('approve_user', { p_id: id, p_generation: num(gen) }),
@@ -254,6 +269,13 @@ const Remote = (() => {
     linkTeamSession: (id, sid) => rpc('link_team_session', { p_team: id, p_session: sid }),
     unlinkTeamSession: (id, sid) => rpc('unlink_team_session', { p_team: id, p_session: sid }),
     publishTeam: (id) => rpc('publish_team', { p_team: id }),
+    // 3단계: 팀 삭제·복구(관리자), 명예의 전당, 명단 가져오기, 차시 일괄 편집
+    deleteTeam: (id, reason) => rpc('delete_team', { p_team_id: id, p_reason: reason || '' }),
+    restoreTeam: (id) => rpc('restore_team', { p_team_id: id }),
+    featureItem: (kind, id, note) => rpc('feature_item', { p_kind: kind, p_item_id: id, p_note: note || '' }),
+    unfeatureItem: (kind, id) => rpc('unfeature_item', { p_kind: kind, p_item_id: id }),
+    importRoster: (year, rows) => rpc('import_roster', { p_year: Number(year), p_rows: rosterRows(rows) }),
+    updateSessionsBulk: (year, items) => rpc('update_sessions_bulk', { p_year: Number(year), p_items: items.map((x) => ({ id: x.id, title: x.title, held_on: x.heldOn || '', description: x.description || '' })) }),
     // 2단계: 게시판
     createPost: (o) => rpc('create_post', { p_board: o.board, p_title: o.title, p_body: o.body || '', p_tags: o.tags || [], p_visibility: o.visibility || 'members',
       p_team_id: o.teamId || null, p_project_id: o.projectId || null, p_session_ids: o.sessionIds || [], p_pinned: !!o.pinned }),
@@ -288,6 +310,9 @@ const Remote = (() => {
     Api.logout = async () => { await client.auth.signOut(); versionCache.clear(); ensuredFor = null; await refresh(); };
     Api.ping = ping;
     Api.serverStatus = serverStatus;
+    Api.previewRoster = async (year, rows) => rpc('preview_roster', { p_year: Number(year), p_rows: rosterRows(rows) });   // 미리보기는 아무것도 쓰지 않는다
+    Api.storageUsage = storageUsage;
+    Api.cleanupOrphans = cleanupOrphans;
     // 파일은 Supabase Storage(비공개 버킷 pop-files)에 올린다. 덮어쓰기는 하지 않고(upsert:false), 열람은 60초짜리 서명 주소로만 한다.
     FileStore.limitBytes = () => (Store.db?.settings?.maxUploadMB || 20) * 1048576;
     FileStore.put = async (path, file) => {
@@ -308,6 +333,24 @@ const Remote = (() => {
     if (/exceed|too large|maximum/i.test(msg)) return '파일이 너무 큽니다. 업로드 용량 제한을 확인하세요.';
     if (/not found|Object not found/i.test(msg)) return '파일을 찾을 수 없습니다.';
     return cleanError(msg);
+  }
+
+  /* ---------- 저장 공간 ---------- */
+  const mapUsage = (d) => ({
+    available: d.available !== false, limitBytes: Number(d.limit_bytes), totalBytes: Number(d.total_bytes), totalCount: Number(d.total_count),
+    byPrefix: d.by_prefix ? d.by_prefix.map((x) => ({ prefix: x.prefix, bytes: Number(x.bytes), count: Number(x.count) })) : null,
+    largest: d.largest ? d.largest.map((x) => ({ path: x.path, size: Number(x.size), createdAt: ts(x.created_at), linked: x.linked || null })) : null,
+    orphans: d.orphans ? d.orphans.map((x) => ({ path: x.path, size: Number(x.size), createdAt: ts(x.created_at), deletable: !!x.deletable })) : null,
+    orphanCount: d.orphan_count == null ? null : Number(d.orphan_count), orphanBytes: d.orphan_bytes == null ? null : Number(d.orphan_bytes),
+  });
+  async function storageUsage() { return mapUsage(await rpc('storage_usage', {})); }
+  /** 고아 파일 정리: Storage 에서 지우고(삭제 권한은 서버 정책이 다시 검사한다) 실제로 사라진 개수를 감사 기록으로 남긴다 */
+  async function cleanupOrphans(paths) {
+    if (!paths.length) throw new ApiError('정리할 파일이 없습니다.');
+    const { error } = await client.storage.from('pop-files').remove(paths);
+    if (error) throw new ApiError(storageError(error.message));
+    const removed = await rpc('log_orphan_cleanup', { p_paths: paths });
+    return removed;
   }
 
   /* ---------- 서버 상태 ---------- */

@@ -119,7 +119,10 @@ function route(parts, q, u) {
   switch (a) {
     case undefined: return viewHome(q);
     case 'archive': return viewArchive();
-    case 'activity': return b ? (c ? viewSession(b, c, q) : viewYear(b)) : viewYears();
+    case 'hall': return viewHall(b);
+    case 'search': return viewSearch(q);
+    case 'stats': return viewStats(q);
+    case 'activity': return b ? (c ? viewSession(b, c, q) : viewYear(b, q)) : viewYears();
     case 'status': return viewStatus();
     case 'me': return viewActivity(u.id, q);
     case 'u': case 'member': return viewActivity(b, q);
@@ -152,7 +155,7 @@ function layout(u, body, section) {
   const items = [['#/', '홈', '', 'Compass'], ['#/board', '게시판', 'board', 'Newspaper'], ['#/teams', '팀 프로젝트', 'teams', 'Users'],
     ['#/activity', '활동', 'activity', 'CalendarDays'], ['#/archive', '기수 아카이브', 'archive', 'Layers']];
   if (staff) items.push(['#/admin', '관리', 'admin', 'Settings']);
-  const SECTION_OF = { post: 'board', team: 'teams' };
+  const SECTION_OF = { post: 'board', team: 'teams', hall: 'archive' };
   const isOn = (key) => (SECTION_OF[section] || section) === key || (key === '' && section === 'p');
   return html`
   <button class="skip-link" data-act="skipToMain">본문으로 건너뛰기</button>
@@ -162,6 +165,8 @@ function layout(u, body, section) {
       ${items.map(([href, label, key]) => html`<a href="${href}" class="${isOn(key) ? 'on' : ''}" ${isOn(key) ? raw('aria-current="page"') : ''}>${label}</a>`)}
     </nav>
     <div class="nav-right">
+      <form class="topbar-search" data-form="globalSearch" role="search"><label class="input-icon"><span class="sr-only">전체 검색</span>${icon('Search', 14)}<input type="search" name="gq" placeholder="전체 검색" aria-keyshortcuts="/"></label></form>
+      <a href="#/search" class="icon-btn search-icon-btn" aria-label="검색">${icon('Search', 18)}</a>
       ${u.status === 'active' ? html`<a href="#/new" class="btn btn-primary btn-sm" aria-label="새 프로젝트">${icon('Plus', 15)}<span class="new-label">새 프로젝트</span></a>` : ''}
       <a href="#/notifications" class="icon-btn" aria-label="알림${unread ? ` ${unread}개 안 읽음` : ''}">${icon('Bell', 18)}${unread ? html`<span class="dot">${unread > 9 ? '9+' : unread}</span>` : ''}</a>
       <details class="dropdown">
@@ -181,6 +186,9 @@ function layout(u, body, section) {
   <nav class="mobile-nav" id="mobile-nav" aria-label="모바일 메뉴">
     ${items.map(([href, label, key, ic]) => html`<a href="${href}" class="${isOn(key) ? 'on' : ''}" ${isOn(key) ? raw('aria-current="page"') : ''}>${icon(ic, 18)}${label}</a>`)}
     ${u.status === 'active' ? html`<a href="#/new">${icon('Plus', 18)}새 프로젝트</a>` : ''}
+    <a href="#/search">${icon('Search', 18)}검색</a>
+    <a href="#/hall">${icon('Award', 18)}명예의 전당</a>
+    <a href="#/stats">${icon('ChartColumn', 18)}통계</a>
     <a href="#/me" class="${section === 'me' || section === 'member' || section === 'u' ? 'on' : ''}">${icon('User', 18)}내 정보</a>
     <a href="#/notifications">${icon('Bell', 18)}알림${unread ? html` <span class="counter counter-accent">${unread}</span>` : ''}</a>
   </nav>
@@ -905,7 +913,7 @@ function viewArchive() {
   roots.forEach((p) => { const k = p.generation ?? '미지정'; (groups[k] = groups[k] || []).push(p); });
   const keys = Object.keys(groups).sort((a, b) => (a === '미지정') - (b === '미지정') || Number(b) - Number(a));
   const forkCount = (rootId) => Api.treeOf(rootId).filter((x) => x.parentId && !x.deleted && Api.canSee(x)).length;
-  const header = pageHeader('기수 아카이브', '선배의 원본과, 그 위에 이어진 수정본의 계보');
+  const header = pageHeader('기수 아카이브', '선배의 원본과, 그 위에 이어진 수정본의 계보', html`<a class="btn btn-sm" href="#/hall">${icon('Award', 14)}명예의 전당</a><a class="btn btn-sm btn-tertiary" href="#/stats">${icon('ChartColumn', 14)}통계</a>`);
   if (!keys.length) {
     return html`${header}${empty('아직 아카이브에 올라온 원본이 없습니다', '원본 프로젝트를 올리면 작성자의 기수에 맞춰 이곳에 정리됩니다.',
       Api.me().status === 'active' ? html`<a class="btn btn-primary btn-sm" href="#/new">${icon('Plus', 15)}새 프로젝트</a>` : '')}`;
@@ -989,7 +997,7 @@ function viewActivity(userId, q = {}) {
       <h1>${target.name}</h1>
       <div class="meta" style="margin-top:4px">${mine || Api.isStaff(me) ? html`<span>${target.email}</span>` : ''}<span>현재 직책: ${roleText(target)}</span>${target.memberNo ? html`<span class="mono">${target.memberNo}</span>` : ''}${target.generation ? html`<span>${target.generation}기</span>` : ''}${target.status !== 'active' ? html`<span>${STATUS_LABEL[target.status] || ''}</span>` : ''}</div>
     </div></div>
-    <div class="actions"><button class="btn" data-act="copyReport" data-id="${userId}">${icon('Copy', 15)}활동 보고서 복사</button></div>
+    <div class="actions"><button class="btn" data-act="copyReport" data-id="${userId}">${icon('Copy', 15)}활동 보고서 복사</button>${mine ? html`<button class="btn" data-act="exportMine" title="내 코드·게시물·제작자 기록·올린 팀 파일을 ZIP 으로">${icon('Download', 15)}내 데이터 내보내기</button>` : ''}</div>
   </header>
   <p class="impact">
     <span>내 작품에서 이어진 수정본 <b class="num">${a.forksOfMine}</b></span>
@@ -1047,11 +1055,14 @@ const AUDIT_LABEL = {
   'session.unlink_past': '지난 연도 차시 연결 해제', 'membership.updated_past': '지난 연도 명단 수정',
   'team.past_edit': '지난 연도 팀 프로젝트 수정', 'team.status': '팀 상태 변경(운영진)', 'team.leader_changed': '팀장 변경(운영진)', 'team.published': '팀 프로젝트 게시',
   'team.credits_edited': '게시 후 제작자 표시 수정', 'team.session_link_past': '팀 지난 연도 차시 연결', 'team.session_unlink_past': '팀 지난 연도 차시 연결 해제',
+  'team.deleted': '팀 프로젝트 삭제(관리자)', 'team.restored': '팀 프로젝트 복구', 'hall.featured_past': '지난 연도 우수 작업물 지정', 'hall.unfeatured_past': '지난 연도 우수 작업물 해제',
+  'roster.imported': '명단 가져오기(CSV)', 'storage.orphans_cleaned': '고아 파일 정리',
   'post.deleted': '게시물 삭제(운영진)', 'post.hidden': '게시물 숨김', 'post.unhidden': '게시물 숨김 해제', 'post.comment_deleted': '댓글 삭제(운영진)',
 };
 const DETAIL_KEY = {
   role: '직책', email: '이메일', emails: '이메일', from: '이전', to: '변경', title: '제목', year: '연도', no: '차시', perm: '권한', enabled: '켬', count: '개수',
   domain: '도메인', signup_mode: '가입 방식', club_name: '동아리 이름', max_file_kb: '파일 용량(KB)', max_upload_mb: '업로드 용량(MB)', whitelist_count: '명단 수', name: '이름',
+  created: '새 회원', updated: '갱신', skipped: '제외', invites: '사전 등록', activated: '활동 전환', requested: '요청', removed: '삭제', posts: '게시물',
   from_name: '병합된 대기 회원', member_no: '회원 번호', generation: '기수', grade: '학년', action: '처리', reason: '사유',
 };
 function detailText(d) {
@@ -1095,6 +1106,8 @@ function viewAdmin(q) {
   if (admin) T.push(['perms', '서버 관리자 권한', null]);
   if (manager) T.push(['accounts', '계정 연결', null]);
   if (admin) T.push(['years', '연도', null]);
+  if (admin) T.push(['roster', '명단 가져오기', null]);
+  if (admin) { const dn = Api.deletedTeams().length; T.push(['deletedTeams', '삭제된 팀', dn || null]); T.push(['storage', '저장 공간', null]); }
   T.push(['reports', '신고', openReports], ['hidden', '숨김 프로젝트', null]);
   if (admin) T.push(['audit', '감사 기록', null]);
   T.push(['settings', '설정', null]);
@@ -1130,6 +1143,12 @@ function viewAdmin(q) {
     body = adminAccountsTab(users);
   } else if (tab === 'years') {
     body = adminYearsTab(q, users);
+  } else if (tab === 'roster') {
+    body = adminRosterTab();
+  } else if (tab === 'deletedTeams') {
+    body = adminDeletedTeamsTab();
+  } else if (tab === 'storage') {
+    body = adminStorageTab();
   } else if (tab === 'audit') {
     const logs = Api.auditLogs();
     body = logs.length ? html`<div class="table-wrap"><table class="tbl"><thead><tr><th>시각</th><th>행위자</th><th>내용</th><th>대상</th><th>상세</th></tr></thead><tbody>
@@ -1188,7 +1207,10 @@ function adminDashboard(u, users) {
   const st = ui.serverStatus;
   if (Api.canServerDetail(u)) ui.after.push(() => loadServerStatus());
   const lastPing = st?.pings?.[0];
+  if (Api.canServerDetail(u)) ui.after.push(() => loadStorageUsage());
+  const health = healthItems(u, users);
   return html`
+  ${health.length ? html`<div class="health-list" role="status">${health.map((x) => html`<div class="callout ${x.lvl === 'warn' ? 'callout-warn' : ''}">${icon(x.lvl === 'warn' ? 'TriangleAlert' : 'Info')}<div>${x.text}</div></div>`)}</div>` : ''}
   <p class="impact">
     <span>운영 연도 <b class="num">${y}</b></span>
     <span>활동 회원 <b class="num">${active}</b></span>
@@ -1208,7 +1230,8 @@ function adminDashboard(u, users) {
         ${st ? html`<div class="item-list">
           <div class="item"><div class="item-main"><div class="item-title">최근 연결 확인</div><div class="item-sub">${lastPing ? `${fmtDate(lastPing.at)} · ${lastPing.ok ? '정상' : '실패'}` : '기록 없음'}</div></div></div>
           <div class="item"><div class="item-main"><div class="item-title">DB 크기</div><div class="item-sub">${fmtSize(st.dbSize)} (무료 요금제 500MB)</div></div></div>
-          <div class="item"><div class="item-main"><div class="item-title">최근 백업</div><div class="item-sub">${st.canBackup ? (st.backup ? `${fmtDate(st.backup.at)} · ${st.backup.ok ? '성공' : '실패'}` : '기록 없음') : '권한 없음'}</div></div></div></div>`
+          <div class="item"><div class="item-main"><div class="item-title">최근 백업</div><div class="item-sub">${st.canBackup ? (st.backup ? `${fmtDate(st.backup.at)} · ${st.backup.ok ? '성공' : '실패'}` : '기록 없음') : '권한 없음'}</div></div></div>
+          <div class="item"><div class="item-main"><div class="item-title">저장 공간</div><div class="item-sub">${ui.storage ? `${fmtSize(ui.storage.totalBytes)} / ${fmtSize(ui.storage.limitBytes)} (무료 요금제 1GB) · ${ui.storage.totalCount}개${ui.storage.orphanCount ? ` · 고아 파일 ${ui.storage.orphanCount}개` : ''}` : (ui.storageErr || '불러오는 중…')}</div></div>${admin ? html`<div class="item-side"><a class="link small" href="#/admin?tab=storage">관리</a></div>` : ''}</div></div>`
           : html`<p class="faint small">${Api.canServerDetail(u) ? (ui.serverStatusErr || '불러오는 중…') : '서버 상태 페이지에서 연결을 확인할 수 있습니다.'}</p>`}</section>
     </div>
     <aside>
@@ -1319,7 +1342,7 @@ function adminYearsTab(q, users) {
       ${years.map((y) => html`<tr><td><b>${y.year}</b></td><td class="muted small">${y.startsOn} ~ ${y.endsOn}</td>
         <td>${y.year === cur ? html`<span class="badge badge-ok">현재</span>` : html`<span class="badge badge-muted">보관</span>`}</td>
         <td class="num">${Api.membershipOf(y.year).length}명</td>
-        <td style="text-align:right"><a class="btn btn-sm btn-tertiary" href="#/admin?tab=years&year=${y.year}">명단</a> <a class="btn btn-sm btn-tertiary" href="#/activity/${y.year}">차시</a></td></tr>`)}
+        <td style="text-align:right"><a class="btn btn-sm btn-tertiary" href="#/admin?tab=years&year=${y.year}">명단</a> <a class="btn btn-sm btn-tertiary" href="#/activity/${y.year}">차시</a> <a class="btn btn-sm btn-tertiary" href="#/hall/${y.year}">명예의 전당</a></td></tr>`)}
     </tbody></table></div></section>
   <section class="section"><div class="section-head"><h2>${sel}년 회원 명단<span class="count">${rows.length}명</span></h2>
     ${sel !== cur ? html`<span class="badge badge-warn">지난 연도 · 수정하면 감사 기록에 남습니다</span>` : ''}</div>
@@ -1330,7 +1353,7 @@ function adminYearsTab(q, users) {
         <td colspan="3" style="padding:0"><form class="row" data-form="membership" data-id="${r.memberId}" data-year="${sel}" style="padding:8px 12px">
           <label><span class="sr-only">${m.name} 기수</span><input name="generation" type="number" min="1" value="${r.generation ?? ''}" style="width:72px" placeholder="기수"></label>
           <label><span class="sr-only">${m.name} 학년</span><input name="grade" type="number" min="1" max="6" value="${r.grade ?? ''}" style="width:64px" placeholder="학년"></label>
-          <span class="faint small" style="min-width:120px">${(r.roles || []).length ? r.roles.map((c) => ROLE_LABEL[c] || c).join(', ') : '부원'}</span>
+          <span class="faint small" style="min-width:120px">${(r.roles || []).length ? r.roles.map((c) => ROLE_LABEL[c] || c).join(', ') : '부원'}${r.note ? ` · 메모: ${r.note}` : ''}</span>
           <button class="btn btn-sm">저장</button></form></td>
         <td>${r.status === 'active' ? html`<span class="badge badge-ok">활동</span>` : html`<span class="badge badge-muted">${STATUS_LABEL[r.status] || r.status}</span>`}</td></tr>`; })}</tbody></table></div>` : emptyInline('이 연도의 명단이 비어 있습니다.')}
     ${addable.length ? html`<form class="row" data-form="membershipAdd" data-year="${sel}" style="margin-top:12px">
@@ -1360,16 +1383,19 @@ function viewYears() {
       <td>${y.year === cur ? html`<span class="badge badge-ok">현재 연도</span>` : html`<span class="badge badge-muted">지난 연도${isAdmin(Api.me()) ? '' : ' · 읽기 전용'}</span>`}</td></tr>`)}</tbody></table></div>`
     : empty('아직 운영 연도가 없습니다', '잠시 후 다시 확인하세요.')}`;
 }
-function viewYear(yearStr) {
+function viewYear(yearStr, q = {}) {
   const year = Number(yearStr);
   const sessions = Api.sessionsOf(year);
   const y = Api.years().find((x) => x.year === year);
   if (!y || !sessions.length) throw new Error('없는 운영 연도입니다.');
   const admin = isAdmin(Api.me());
   const unclassified = admin && !Api.isPastYear(year) ? Api.unclassifiedProjects() : [];
+  const me = Api.me(); const canBulk = me.status === 'active' && (Api.isPastYear(year) ? admin : isStaff(me));
+  const editAll = canBulk && q.edit === 'all';
   return html`
   <div class="eyebrow"><a href="#/activity">활동</a>${icon('ChevronRight', 13)}<span>${year}년</span></div>
-  ${pageHeader(`${year}년 운영 연도`, `${y.startsOn} ~ ${y.endsOn}`, readOnlyBadge(year))}
+  ${pageHeader(`${year}년 운영 연도`, `${y.startsOn} ~ ${y.endsOn}`, html`${readOnlyBadge(year)}<a class="btn btn-sm" href="#/hall/${year}">${icon('Award', 14)}명예의 전당</a>${canBulk && !editAll ? html`<a class="btn btn-sm" href="#/activity/${year}?edit=all">${icon('Pencil', 14)}차시 일괄 편집</a>` : ''}`)}
+  ${editAll ? html`${Api.isPastYear(year) ? html`<div class="callout callout-warn" style="margin-bottom:12px">${icon('TriangleAlert')}<div>지난 연도의 차시입니다. 바뀐 차시마다 감사 기록에 남습니다.</div></div>` : ''}${bulkSessionsForm(year, sessions)}` : ''}
   <div class="table-wrap"><table class="tbl"><thead><tr><th>차시</th><th>제목</th><th>날짜</th><th>결과물</th></tr></thead><tbody>
     ${sessions.map((s) => html`<tr><td><a class="link" href="#/activity/${year}/${s.no}"><b>${s.no}차시</b></a></td><td>${s.title}</td>
       <td class="muted small">${s.heldOn || '—'}</td><td class="num">${Api.projectsOfSession(s.id).length}개</td></tr>`)}</tbody></table></div>
@@ -1473,7 +1499,7 @@ function viewStatus() {
   const p = ui.ping;
   const last = lastOkLocal();
   const detail = canStatusDetail();
-  if (detail) ui.after.push(() => loadServerStatus());
+  if (detail) ui.after.push(() => { loadServerStatus(); loadStorageUsage(); });
   const st = ui.serverStatus;
   return html`
   ${pageHeader('서버 상태', '서버와 DB 가 응답하는지 확인합니다.')}
@@ -1497,6 +1523,8 @@ function viewStatus() {
         <tr><td>현재 운영 연도</td><td class="num">${st.year}</td></tr>
         ${Object.entries(st.counts).map(([k, v]) => html`<tr><td>${{ profiles: '회원', projects: '프로젝트', versions: '버전', comments: '댓글', notifications: '알림', sessions: '차시', audit_logs: '감사 기록', team_projects: '팀 프로젝트', posts: '게시물', team_file_versions: '팀 파일 버전' }[k] || k}</td><td class="num">${v}행</td></tr>`)}
       </tbody></table></div>
+      <div class="section-head" style="margin-top:20px"><h3>저장 공간</h3></div>
+      ${ui.storage ? storageMeter(ui.storage) : emptyInline(ui.storageErr || '불러오는 중…')}
       <div class="section-head" style="margin-top:20px"><h3>최근 연결 확인</h3></div>
       ${st.pings.length ? html`<div class="item-list">${st.pings.map((x) => html`<div class="item"><div class="item-main">${fmtDate(x.at)}</div><div class="item-side">${x.ok ? '정상' : '실패'}</div></div>`)}</div>` : emptyInline('기록이 없습니다.')}
       <div class="section-head" style="margin-top:20px"><h3>최근 백업</h3></div>
@@ -1595,7 +1623,7 @@ function viewTeams(q) {
   ${list.length ? html`<div class="item-list">${list.map((t) => {
     const members = Api.teamMembersOf(t.id).filter((m) => m.status === 'active');
     return html`<div class="item"><div class="item-main">
-      <div class="item-title"><a href="#/team/${t.id}">${t.name}</a>${teamBadge(t)}<span class="badge">${t.year}년</span>${pastBadge(t.year)}</div>
+      <div class="item-title"><a href="#/team/${t.id}">${t.name}</a>${teamBadge(t)}<span class="badge">${t.year}년</span>${pastBadge(t.year)}${t.deletedAt ? html`<span class="badge badge-danger">삭제됨</span>` : ''}</div>
       ${t.description ? html`<div class="item-sub">${t.description}</div>` : ''}
       <div class="item-sub">팀장 ${Api.user(t.leader).name} · 팀원 ${members.length}명</div></div>
       <div class="item-side">${timeAgo(t.updatedAt)}</div></div>`;
@@ -1638,6 +1666,8 @@ function viewTeam(id, q) {
       ${Api.sessionsOfTeam(id).map((s) => html`<span>${icon('CalendarDays', 13)}<a class="link" href="#/activity/${s.year}/${s.no}">${s.year} ${s.no}차시</a></span>`)}
       ${post ? html`<span>${icon('Newspaper', 13)}<a class="link" href="#/post/${post.id}">게시물 보기</a></span>` : ''}</div>
   </div></div>
+  ${t.deletedAt ? html`<div class="callout callout-warn" style="margin-bottom:16px">${icon('Trash2')}<div>관리자에 의해 삭제된 팀입니다. 관리자에게만 보입니다.${t.deleteReason ? ` 사유: ${t.deleteReason}` : ''}
+    <div style="margin-top:8px"><button class="btn btn-sm" data-act="restoreTeam" data-id="${t.id}">${icon('RotateCcw', 14)}복구</button></div></div></div>` : ''}
   ${ac.past && !ac.admin ? html`<div class="callout callout-warn" style="margin-bottom:16px">${icon('Lock')}<div>지난 연도의 팀 프로젝트입니다. 읽기 전용이며 관리자만 고칠 수 있습니다.</div></div>` : ac.past ? html`<div class="callout callout-warn" style="margin-bottom:16px">${icon('TriangleAlert')}<div>지난 연도의 팀 프로젝트입니다. 수정하면 감사 기록에 남습니다.</div></div>` : ''}
   ${mine && mine.status === 'invited' ? html`<div class="callout callout-warn" style="margin-bottom:16px">${icon('Info')}<div>이 팀에 초대받았습니다. 수락하면 파일과 메모를 볼 수 있습니다.
     <div class="row" style="margin-top:8px"><button class="btn btn-sm btn-primary" data-act="respondInvite" data-id="${id}" data-v="1">수락</button><button class="btn btn-sm" data-act="respondInvite" data-id="${id}" data-v="0">거절</button></div></div></div>` : ''}
@@ -1795,7 +1825,13 @@ function teamSettingsTab(t, ac, u) {
     <p class="faint small" style="margin:-4px 0 8px">${canLink ? '체크하면 차시에 연결되고, 해제하면 연결이 끊어집니다. 여러 차시에 연결할 수 있습니다.' : '팀장 또는 운영진만 연결할 수 있습니다.'}</p>
     ${Api.years().filter((y) => y.year === cur).map(yearBlock)}
     ${ac.admin && Api.years().some((y) => y.year !== cur) ? html`<details class="section"><summary class="small muted" style="cursor:pointer;margin-bottom:8px">지난 연도 차시 (관리자만 · 감사 기록에 남음)</summary>${Api.years().filter((y) => y.year !== cur).map(yearBlock)}</details>` : ''}
-  </section>`;
+  </section>
+  ${ac.admin && !t.deletedAt ? html`<section class="section danger-zone"><div class="section-head"><h2>위험 영역 · 팀 삭제</h2></div>
+    <p class="faint small" style="margin:-4px 0 8px">관리자만 보이는 기능입니다. 삭제하면 팀·파일·메모·연결된 게시물이 관리자 외에는 어디에서도 보이지 않게 됩니다. 저장된 파일은 지워지지 않으며 [관리 &gt; 삭제된 팀]에서 복구할 수 있습니다. 팀원에게 알림이 가고 감사 기록에 남습니다.</p>
+    <form data-form="teamDelete" data-id="${t.id}" class="stack narrow">
+      <label class="field"><span>확인을 위해 팀 이름을 그대로 입력하세요: <b>${t.name}</b></span><input name="confirmName" autocomplete="off" required></label>
+      <label class="field"><span>삭제 사유 <span class="faint">(선택, 500자)</span></span><input name="reason" maxlength="500"></label>
+      <div><button class="btn btn-danger">${icon('Trash2', 15)}팀 삭제</button></div></form></section>` : ''}`;
 }
 
 /* ---------- 게시판 ---------- */
@@ -1972,7 +2008,7 @@ function safe(fn, lockEl) {
   try { r = fn(); } catch (e) { console.error(e); toast(e.message, 'error'); done(); return; }
   Promise.resolve(r).catch((e) => { console.error(e); toast(e.message, 'error'); }).finally(done);
 }
-const resetUi = () => { ui.editors = {}; ui.editor = null; ui.newDraft = null; ui.serverStatus = null; ui.serverStatusTried = false; ui.serverStatusErr = null; ui.ping = null; };
+const resetUi = () => { ui.editors = {}; ui.editor = null; ui.newDraft = null; ui.serverStatus = null; ui.serverStatusTried = false; ui.serverStatusErr = null; ui.ping = null; ui.storage = null; ui.storageTried = false; ui.storageErr = null; ui.roster = null; };
 const Actions = {
   toggleMenu(el) {
     const open = document.body.classList.toggle('nav-open');
@@ -2387,6 +2423,386 @@ Object.assign(Forms, {
   },
 });
 
+
+/* ===================== 3단계: 명예의 전당 · 검색 · 통계 · 명단 가져오기 · 저장 공간 · 내 데이터 ===================== */
+const FEATURE_KIND = { team: '팀 프로젝트', post: '게시물', project: '코드 프로젝트' };
+const pct = (n, max) => (max > 0 ? Math.max(2, Math.round((n / max) * 100)) : 0);
+const bar = (n, max) => html`<span class="bar-track" aria-hidden="true"><span style="width:${n ? pct(n, max) : 0}%"></span></span>`;
+
+/* ---------- 명예의 전당 ---------- */
+function viewHall(yearStr) {
+  const years = Api.years(); const cur = Api.currentYear();
+  const year = yearStr ? Number(yearStr) : cur;
+  if (!years.some((y) => y.year === year)) throw new Error('없는 운영 연도입니다.');
+  const h = Api.hall(year); const u = Api.me();
+  const canFeature = u.status === 'active' && (h.current ? isStaff(u) : isAdmin(u));
+  const taken = new Set(h.featured.map((x) => `${x.f.kind}:${x.f.itemId}`));
+  const cand = canFeature ? [
+    ...h.teams.map((t) => [`team:${t.id}`, `팀 · ${t.name}`]),
+    ...Api.listPosts({}).filter((p) => p.year === year && p.board !== 'notice' && p.visibility === 'members' && !p.hidden).map((p) => [`post:${p.id}`, `게시물 · ${p.title}`]),
+    ...Api.listProjects({}).filter((p) => p.year === year).map((p) => [`project:${p.id}`, `코드 · ${p.title}`]),
+  ].filter(([k]) => !taken.has(k)) : [];
+  return html`
+  <div class="eyebrow"><a href="#/archive">기수 아카이브</a>${icon('ChevronRight', 13)}<span>명예의 전당</span></div>
+  ${pageHeader(`${year}년 명예의 전당`, '그 해 임원·회원·결과물의 기록입니다. 졸업생도 그대로 남습니다.', pastBadge(year))}
+  <form class="toolbar" data-form="hallYear" role="search">
+    <label><span class="sr-only">연도</span><select name="year" data-change="submitForm">${years.map((y) => html`<option value="${y.year}" ${y.year === year ? raw('selected') : ''}>${y.year}년${y.year === cur ? ' (현재)' : ''}</option>`)}</select></label>
+    <a class="btn btn-tertiary btn-sm" href="#/activity/${year}">${icon('CalendarDays', 14)}차시 보기</a>
+    <a class="btn btn-tertiary btn-sm" href="#/stats?year=${year}">${icon('ChartColumn', 14)}통계</a>
+  </form>
+  <p class="impact"><span>회원 <b class="num">${h.members}</b></span><span>게시된 팀 프로젝트 <b class="num">${h.teams.length}</b></span><span>코드 프로젝트 <b class="num">${h.projects}</b></span><span>우수 작업물 <b class="num">${h.featured.length}</b></span></p>
+  <section class="section" style="margin-top:0"><div class="section-head"><h2>우수 작업물<span class="count">${h.featured.length}</span></h2></div>
+    ${h.featured.length ? html`<div class="item-list">${h.featured.map((x) => html`<div class="item"><div class="item-main"><div class="item-title"><a href="${x.link}">${x.title}</a><span class="badge">${x.label}</span></div>
+      <div class="item-sub">${x.sub}${x.f.note ? ' · ' + x.f.note : ''}</div></div>
+      <div class="item-side">${canFeature ? html`<button class="btn btn-sm btn-tertiary" data-act="unfeature" data-kind="${x.f.kind}" data-id="${x.f.itemId}">해제</button>` : ''}</div></div>`)}</div>` : emptyInline('아직 지정된 우수 작업물이 없습니다.')}
+    ${canFeature ? html`<form class="row" data-form="feature" style="margin-top:12px">
+      <label><span class="sr-only">우수 작업물로 지정할 항목</span><select name="item" style="width:auto;min-width:220px;max-width:100%"><option value="">지정할 항목 선택</option>${cand.map(([v, l]) => html`<option value="${v}">${l}</option>`)}</select></label>
+      <label><span class="sr-only">메모</span><input name="note" maxlength="200" placeholder="메모 (선택)" style="min-width:180px"></label>
+      <button class="btn btn-sm btn-primary">${icon('Star', 14)}우수 작업물로 지정</button></form>
+      ${!h.current ? html`<p class="faint xs" style="margin-top:6px">지난 연도의 지정·해제는 관리자만 할 수 있고 감사 기록에 남습니다.</p>` : ''}` : ''}
+  </section>
+  <section class="section"><div class="section-head"><h2>임원</h2></div>
+    ${h.officers.length ? html`<div class="item-list">${h.officers.map((o) => html`<div class="item"><div class="item-main"><div class="item-title">${o.label}</div>
+      <div class="item-sub">${o.members.map((m, i) => html`${i ? ', ' : ''}<a class="link" href="#/member/${m.id}">${m.name}</a>`)}</div></div></div>`)}</div>` : emptyInline('이 해의 직책 기록이 없습니다.')}
+    <p class="faint xs" style="margin-top:6px">그 해 명단에 기록된 직책입니다. 연도가 지나면 그 해 마지막 직책으로 굳습니다.</p></section>
+  <section class="section"><div class="section-head"><h2>회원<span class="count">${h.members}명</span></h2></div>
+    ${h.generations.length ? h.generations.map((g) => html`<div class="gen-block"><div class="aside-title">${g.generation == null ? '기수 미지정' : `${g.generation}기`} · ${g.members.length}명</div>
+      <div class="chip-row">${g.members.map((m) => html`<a class="user-chip hall-chip" href="#/member/${m.user.id}">${avatar(m.user)}<span class="user-name">${m.user.name}</span>
+        ${m.grade ? html`<span class="faint xs">${m.grade}학년</span>` : ''}${m.user.status === 'graduated' || m.status === 'graduated' ? html`<span class="badge badge-muted">졸업</span>` : ''}</a>`)}</div></div>`)
+      : emptyInline('이 해의 회원 명단이 비어 있습니다.')}</section>
+  <section class="section"><div class="section-head"><h2>게시된 팀 프로젝트<span class="count">${h.teams.length}</span></h2></div>
+    ${h.teams.length ? html`<div class="item-list">${h.teams.map((t) => html`<div class="item"><div class="item-main"><div class="item-title"><a href="#/team/${t.id}">${t.name}</a></div>
+      <div class="item-sub">팀장 ${Api.user(t.leader).name}${t.description ? ' · ' + t.description : ''}</div></div><div class="item-side">${fmtDate(t.publishedAt).slice(0, 10)}</div></div>`)}</div>` : emptyInline('게시된 팀 프로젝트가 없습니다.')}</section>
+  <section class="section"><div class="section-head"><h2>차시별 기록</h2></div>
+    <div class="table-wrap"><table class="tbl"><thead><tr><th>차시</th><th>제목</th><th>코드</th><th>팀</th><th>게시물</th></tr></thead><tbody>
+      ${h.sessions.map((r) => html`<tr><td><a class="link" href="#/activity/${year}/${r.session.no}"><b>${r.session.no}차시</b></a></td><td>${r.session.title}</td><td class="num">${r.projects}</td><td class="num">${r.teams}</td><td class="num">${r.posts}</td></tr>`)}</tbody></table></div></section>`;
+}
+
+/* ---------- 통합 검색 ---------- */
+const SEARCH_TYPES = [['', '전체'], ['project', '코드 프로젝트'], ['team', '팀 프로젝트'], ['post', '게시물'], ['member', '회원'], ['session', '차시']];
+function runSearch({ kw, type, year, session, author }) {
+  const hit = (...parts) => !kw || parts.join(' ').toLowerCase().includes(kw);
+  const want = (t) => !type || type === t;
+  const yearOk = (y) => !year || String(y) === String(year);
+  const out = { project: [], team: [], post: [], member: [], session: [] };
+  if (want('project')) {
+    out.project = Api.listProjects({}).filter((p) => yearOk(p.year)
+      && (!session || Api.sessionsOfProject(p.id).some((s) => s.id === session))
+      && (!author || p.ownerId === author || Api.contributors(p.id).some((c) => c.userId === author))
+      && hit(p.title, p.description, Api.user(p.ownerId).name));
+  }
+  if (want('team')) {
+    out.team = Api.teamList({}).filter((t) => yearOk(t.year)
+      && (!session || Api.sessionsOfTeam(t.id).some((s) => s.id === session))
+      && (!author || t.leader === author || Api.teamMembersOf(t.id).some((m) => m.memberId === author && m.status === 'active'))
+      && hit(t.name, t.description, t.goal, Api.user(t.leader).name));
+  }
+  if (want('post')) {
+    out.post = Api.listPosts({}).filter((p) => yearOk(p.year)
+      && (!session || Api.sessionsOfPost(p.id).some((s) => s.id === session))
+      && (!author || p.author === author)
+      && hit(p.title, p.tags.join(' '), p.body, Api.user(p.author).name));
+  }
+  if (want('member') && !session) {
+    const mem = Store.db.users.filter((x) => x.status === 'active' || x.status === 'graduated');
+    out.member = mem.filter((x) => (!author || x.id === author)
+      && (!year || Store.db.membership.some((m) => m.memberId === x.id && String(m.year) === String(year)))
+      && hit(x.name, x.memberNo, x.generation ? `${x.generation}기` : '')).sort((a, b) => a.name.localeCompare(b.name));
+  }
+  if (want('session') && !author) {
+    out.session = Api.years().flatMap((y) => Api.sessionsOf(y.year)).filter((s) => yearOk(s.year) && (!session || s.id === session)
+      && hit(`${s.year}년 ${s.no}차시`, s.title, s.description));
+  }
+  return out;
+}
+function viewSearch(q) {
+  const kw = (q.q || '').trim().toLowerCase();
+  const type = SEARCH_TYPES.some(([k]) => k === q.type) ? q.type || '' : '';
+  const year = q.year || ''; const session = q.session || ''; const author = q.author || '';
+  const years = Api.years();
+  const sessions = year ? Api.sessionsOf(year) : Api.sessionsOf(Api.currentYear());
+  const members = Store.db.users.filter((x) => x.status === 'active' || x.status === 'graduated').sort((a, b) => a.name.localeCompare(b.name));
+  const searched = !!(kw || year || session || author || type);
+  const res = searched ? runSearch({ kw, type, year, session, author }) : null;
+  const total = res ? Object.values(res).reduce((n, l) => n + l.length, 0) : 0;
+  const LIMIT = 30;
+  const sec = (key, label, list, row) => (list.length ? html`<section class="section"><div class="section-head"><h2>${label}<span class="count">${list.length}</span></h2></div>
+    <div class="item-list">${list.slice(0, LIMIT).map(row)}</div>${list.length > LIMIT ? html`<p class="faint xs" style="margin-top:6px">처음 ${LIMIT}개만 보입니다. 조건을 좁혀 보세요.</p>` : ''}</section>` : '');
+  return html`
+  ${pageHeader('검색', '코드 프로젝트·팀 프로젝트·게시물·회원·차시를 한꺼번에 찾습니다. 내가 볼 수 있는 것만 나옵니다.')}
+  <form class="toolbar" data-form="searchAll" role="search" style="flex-wrap:wrap">
+    <label class="input-icon search-field"><span class="sr-only">검색어</span>${icon('Search', 15)}<input type="search" name="q" value="${q.q || ''}" placeholder="제목, 이름, 회원번호, 태그…" aria-keyshortcuts="/"></label>
+    <label><span class="sr-only">종류</span><select name="type" data-change="submitForm">${SEARCH_TYPES.map(([k, l]) => html`<option value="${k}" ${k === type ? raw('selected') : ''}>${k ? l : '모든 종류'}</option>`)}</select></label>
+    <label><span class="sr-only">연도</span><select name="year" data-change="submitForm"><option value="">모든 연도</option>${years.map((y) => html`<option value="${y.year}" ${String(y.year) === year ? raw('selected') : ''}>${y.year}년</option>`)}</select></label>
+    <label><span class="sr-only">차시</span><select name="session" data-change="submitForm"><option value="">모든 차시</option>${sessions.map((s) => html`<option value="${s.id}" ${s.id === session ? raw('selected') : ''}>${s.year} ${s.no}차시</option>`)}</select></label>
+    <label><span class="sr-only">작성자</span><select name="author" data-change="submitForm"><option value="">모든 작성자</option>${members.map((m) => html`<option value="${m.id}" ${m.id === author ? raw('selected') : ''}>${m.name}</option>`)}</select></label>
+    <button class="btn btn-tertiary search-btn">검색</button>
+    ${searched ? html`<span class="result-count" aria-live="polite">${total}건 · <a class="link" href="#/search">초기화</a></span>` : ''}
+  </form>
+  ${!searched ? empty('검색어나 조건을 입력하세요', '종류·연도·차시·작성자로 좁힐 수 있습니다. 어느 화면에서든 / 키로 검색창에 갈 수 있습니다.')
+    : total === 0 ? empty('결과가 없습니다', '검색어나 조건을 바꿔 보세요.', html`<a class="btn btn-sm" href="#/search">초기화</a>`)
+    : html`
+    ${sec('project', '코드 프로젝트', res.project, (p) => html`<div class="item"><div class="item-main"><div class="item-title"><a href="#/p/${p.id}">${p.title}</a>${typeBadge(p)}</div>
+      <div class="item-sub">${Api.user(p.ownerId).name} · ${p.year ?? ''}년${p.description ? ' · ' + p.description : ''}</div></div></div>`)}
+    ${sec('team', '팀 프로젝트', res.team, (t) => html`<div class="item"><div class="item-main"><div class="item-title"><a href="#/team/${t.id}">${t.name}</a>${teamBadge(t)}${t.deletedAt ? html`<span class="badge badge-danger">삭제됨</span>` : ''}</div>
+      <div class="item-sub">팀장 ${Api.user(t.leader).name} · ${t.year}년${t.description ? ' · ' + t.description : ''}</div></div></div>`)}
+    ${sec('post', '게시물', res.post, (p) => html`<div class="item"><div class="item-main"><div class="item-title"><a href="#/post/${p.id}">${p.title}</a>${boardBadge(p)}</div>
+      <div class="item-sub">${Api.user(p.author).name} · ${p.year}년${p.tags.length ? ' · ' + p.tags.map((t) => '#' + t).join(' ') : ''}</div></div></div>`)}
+    ${sec('member', '회원', res.member, (m) => html`<div class="item"><div class="item-main"><div class="item-title">${userChip(m)}${m.generation ? html`<span class="badge">${m.generation}기</span>` : ''}</div>
+      <div class="item-sub mono">${m.memberNo}</div></div></div>`)}
+    ${sec('session', '차시', res.session, (s) => html`<div class="item"><div class="item-main"><div class="item-title"><a href="#/activity/${s.year}/${s.no}">${s.year}년 ${s.no}차시</a></div>
+      <div class="item-sub">${s.title}${s.description ? ' · ' + s.description : ''}</div></div></div>`)}`}`;
+}
+
+/* ---------- 통계: 숫자만 보여 주고 순위는 매기지 않는다 ---------- */
+function viewStats(q) {
+  const years = Api.years(); const cur = Api.currentYear();
+  const year = years.some((y) => String(y.year) === q.year) ? Number(q.year) : cur;
+  const codes = Api.listProjects({}); const teams = Api.teamList({}).filter((t) => !t.deletedAt); const posts = Api.listPosts({});
+  const mem = (y) => Store.db.membership.filter((m) => m.year === y);
+  const perYear = years.map((y) => ({ y: y.year, code: codes.filter((p) => p.year === y.year).length, team: teams.filter((t) => t.year === y.year).length,
+    post: posts.filter((p) => p.year === y.year).length, active: mem(y.year).filter((m) => m.status === 'active').length }));
+  const maxYear = Math.max(1, ...perYear.map((r) => r.code + r.team + r.post));
+  const yTeams = teams.filter((t) => t.year === year); const yPosts = posts.filter((p) => p.year === year);
+  const byGen = new Map(); mem(year).forEach((m) => { const g = m.generation ?? null; byGen.set(g, (byGen.get(g) || 0) + 1); });
+  const gens = [...byGen.entries()].sort(([a], [b]) => (a == null) - (b == null) || b - a);
+  const maxGen = Math.max(1, ...gens.map(([, n]) => n));
+  const sessRows = Api.sessionsOf(year).map((s) => ({ s, code: Api.projectsOfSession(s.id).length, team: Api.teamsOfSession(s.id).filter((t) => !t.deletedAt).length, post: Api.postsOfSession(s.id).length }));
+  const maxSess = Math.max(1, ...sessRows.map((r) => r.code + r.team + r.post));
+  const statusRows = Object.entries(TEAM_STATUS).map(([k, l]) => [l, yTeams.filter((t) => t.status === k).length]);
+  const boardRows = Object.entries(BOARD_LABEL).map(([k, l]) => [l, yPosts.filter((p) => p.board === k).length]);
+  const maxStat = Math.max(1, ...statusRows.map(([, n]) => n), ...boardRows.map(([, n]) => n));
+  const small = (rows) => html`<div class="table-wrap"><table class="tbl"><tbody>${rows.map(([l, n]) => html`<tr><td style="width:96px">${l}</td><td class="num" style="width:48px">${n}</td><td>${bar(n, maxStat)}</td></tr>`)}</tbody></table></div>`;
+  return html`
+  ${pageHeader('통계', '연도별 활동량입니다. 사람 순위가 아니라 동아리 전체의 숫자만 보여 줍니다.')}
+  <section class="section" style="margin-top:0"><div class="section-head"><h2>연도별</h2></div>
+    <div class="table-wrap"><table class="tbl"><thead><tr><th>연도</th><th>코드</th><th>팀</th><th>게시물</th><th>활동 회원</th><th>활동량</th></tr></thead><tbody>
+      ${perYear.map((r) => html`<tr><td><a class="link" href="#/stats?year=${r.y}"><b>${r.y}년</b></a></td><td class="num">${r.code}</td><td class="num">${r.team}</td><td class="num">${r.post}</td><td class="num">${r.active}</td><td style="min-width:120px">${bar(r.code + r.team + r.post, maxYear)}</td></tr>`)}</tbody></table></div></section>
+  <form class="toolbar" data-form="statsYear"><label><span class="sr-only">연도</span><select name="year" data-change="submitForm">${years.map((y) => html`<option value="${y.year}" ${y.year === year ? raw('selected') : ''}>${y.year}년 자세히</option>`)}</select></label>
+    <a class="btn btn-tertiary btn-sm" href="#/hall/${year}">${icon('Award', 14)}명예의 전당</a></form>
+  <div class="split">
+    <div>
+      <section class="section" style="margin-top:0"><div class="section-head"><h2>${year}년 차시별 결과물</h2></div>
+        <div class="table-wrap"><table class="tbl"><thead><tr><th>차시</th><th>코드</th><th>팀</th><th>게시물</th><th></th></tr></thead><tbody>
+          ${sessRows.map((r) => html`<tr><td><a class="link" href="#/activity/${year}/${r.s.no}">${r.s.no}차시</a></td><td class="num">${r.code}</td><td class="num">${r.team}</td><td class="num">${r.post}</td><td style="min-width:90px">${bar(r.code + r.team + r.post, maxSess)}</td></tr>`)}</tbody></table></div></section>
+      <section class="section"><div class="section-head"><h2>${year}년 기수별 회원</h2></div>
+        ${gens.length ? html`<div class="table-wrap"><table class="tbl"><tbody>${gens.map(([g, n]) => html`<tr><td style="width:96px">${g == null ? '기수 미지정' : `${g}기`}</td><td class="num" style="width:48px">${n}</td><td>${bar(n, maxGen)}</td></tr>`)}</tbody></table></div>` : emptyInline('명단이 없습니다.')}</section>
+    </div>
+    <aside>
+      <div class="aside-title">${year}년 팀 프로젝트 상태</div>${small(statusRows)}
+      <div class="aside-title" style="margin-top:20px">${year}년 게시물</div>${small(boardRows)}
+    </aside>
+  </div>`;
+}
+
+/* ---------- 차시 일괄 편집 (활동 > 연도 화면에서 연다) ---------- */
+function bulkSessionsForm(year, sessions) {
+  return html`<form data-form="sessionsBulk" data-year="${year}" class="stack" style="margin-bottom:24px">
+    <div class="table-wrap"><table class="tbl"><thead><tr><th style="width:56px">차시</th><th>제목</th><th style="width:150px">날짜</th><th>설명</th></tr></thead><tbody>
+      ${sessions.map((s) => html`<tr><td><b>${s.no}</b><input type="hidden" name="id_${s.no}" value="${s.id}"></td>
+        <td><label><span class="sr-only">${s.no}차시 제목</span><input name="title_${s.no}" value="${s.title}" maxlength="100" required></label></td>
+        <td><label><span class="sr-only">${s.no}차시 날짜</span><input type="date" name="date_${s.no}" value="${s.heldOn || ''}"></label></td>
+        <td><label><span class="sr-only">${s.no}차시 설명</span><input name="desc_${s.no}" value="${s.description}" maxlength="1000"></label></td></tr>`)}</tbody></table></div>
+    <div class="row"><button class="btn btn-primary">${icon('Check', 15)}10개 차시 저장</button><a class="btn btn-tertiary" href="#/activity/${year}">취소</a></div></form>`;
+}
+
+/* ---------- 관리: 명단 가져오기 · 삭제된 팀 · 저장 공간 ---------- */
+const ROSTER_STATUS = { existing: ['기존 회원', 'badge-ok'], new: ['신규', 'badge-accent'], dup: ['파일 내 중복', 'badge-warn'], conflict: ['충돌', 'badge-danger'], error: ['오류', 'badge-danger'] };
+function adminRosterTab() {
+  const years = Api.years(); const cur = Api.currentYear(); const st = ui.roster || {};
+  const year = st.year || cur; const res = st.result; const done = st.done;
+  const ok = res ? res.rows.filter((r) => ['new', 'existing'].includes(r.status)).length : 0;
+  return html`
+  <section class="section" style="margin-top:0"><div class="section-head"><h2>명단 가져오기 (CSV)</h2></div>
+    <p class="faint small" style="margin:-4px 0 8px">첫 줄은 머리줄이며 열은 <code>이름,기수,학년,이메일,회원번호,직책</code>입니다(이름 필수). 회원은 <b>회원번호</b>, 없으면 <b>이메일</b>로만 찾고 이름으로는 합치지 않습니다.
+      새 회원은 만들어 두고 그 이메일로 첫 로그인하면 자동 연결됩니다. <b>직책 칸은 메모로만 저장</b>되며 직책은 [직책] 탭에서만 줍니다.</p>
+    <pre class="code-sample">이름,기수,학년,이메일,회원번호,직책
+홍길동,5,1,gildong@${Api.settings().domain},,
+김서연,4,2,,POP-0007,차장</pre>
+    <form data-form="rosterPreview" class="stack narrow">
+      <label class="field" style="max-width:200px"><span>반영할 연도</span><select name="year">${years.map((y) => html`<option value="${y.year}" ${y.year === year ? raw('selected') : ''}>${y.year}년${y.year === cur ? ' (현재)' : ''}</option>`)}</select></label>
+      <label class="field"><span>CSV 파일</span><input type="file" name="file" accept=".csv,text/csv,text/plain"></label>
+      <label class="field"><span>또는 붙여 넣기</span><textarea name="text" rows="6" placeholder="이름,기수,학년,이메일,회원번호,직책">${st.text || ''}</textarea></label>
+      <div class="row"><button class="btn btn-primary">${icon('Search', 15)}미리보기</button>${res ? html`<button type="button" class="btn btn-tertiary" data-act="rosterClear">초기화</button>` : ''}</div></form>
+    ${year !== cur ? html`<p class="faint xs" style="margin-top:6px">지난 연도 명단에 반영하면 감사 기록에 남습니다.</p>` : ''}
+  </section>
+  ${done ? html`<div class="callout" style="margin-bottom:16px">${icon('Check')}<div><b>${done.year}년 명단을 가져왔습니다.</b> 새 회원 ${done.created}명 · 기존 회원 갱신 ${done.updated}명 · 이메일 사전 등록 ${done.invites}건${done.activated ? ` · 승인 대기 → 활동 ${done.activated}명` : ''} · 제외 ${done.skipped}행. 같은 파일을 다시 가져와도 중복으로 만들어지지 않습니다.</div></div>` : ''}
+  ${res ? html`<section class="section"><div class="section-head"><h2>미리보기<span class="count">${res.rows.length}행</span></h2>
+      <span class="row">${Object.entries(res.counts).map(([k, n]) => html`<span class="badge ${ROSTER_STATUS[k][1]}">${ROSTER_STATUS[k][0]} ${n}</span>`)}</span></div>
+    <div class="table-wrap"><table class="tbl"><thead><tr><th>행</th><th>이름</th><th>기수</th><th>학년</th><th>이메일</th><th>회원번호</th><th>직책(메모)</th><th>분류</th><th>설명</th></tr></thead><tbody>
+      ${res.rows.map((r) => html`<tr><td class="muted">${r.idx}</td><td>${r.name}</td><td>${r.generation ?? ''}</td><td>${r.grade ?? ''}</td><td class="small">${r.email}</td><td class="mono small">${r.member_no}</td><td class="small">${r.note}</td>
+        <td><span class="badge ${ROSTER_STATUS[r.status][1]}">${ROSTER_STATUS[r.status][0]}</span></td>
+        <td class="small muted">${r.reason || [r.member_name ? `기존: ${r.member_name}` : '', r.invite ? '이메일 사전 등록' : '', r.activate ? '승인 대기 → 활동' : ''].filter(Boolean).join(' · ')}</td></tr>`)}</tbody></table></div>
+    <div class="row" style="margin-top:12px"><button class="btn btn-primary" data-act="rosterImport" ${ok ? '' : raw('disabled')}>${icon('Upload', 15)}올바른 ${ok}행 가져오기</button>
+      <span class="faint small">오류·충돌·중복 행은 제외됩니다. 가져오기는 감사 기록에 남습니다.</span></div></section>` : ''}`;
+}
+function adminDeletedTeamsTab() {
+  const list = Api.deletedTeams();
+  return html`<p class="faint small" style="margin-bottom:12px">관리자가 삭제한 팀입니다. 관리자 외에는 어디에서도 보이지 않으며, 파일과 기록은 지워지지 않고 보관됩니다. 복구하면 연결된 게시물도 함께 돌아옵니다.</p>
+  ${list.length ? html`<div class="item-list">${list.map((t) => html`<div class="item"><div class="item-main"><div class="item-title"><a href="#/team/${t.id}">${t.name}</a><span class="badge">${t.year}년</span>${teamBadge(t)}</div>
+    <div class="item-sub">팀장 ${Api.user(t.leader).name} · ${fmtDate(t.deletedAt)} 삭제${t.deletedBy ? ' · ' + Api.user(t.deletedBy).name : ''}${t.deleteReason ? ' · 사유: ' + t.deleteReason : ''}</div></div>
+    <div class="item-side"><button class="btn btn-sm" data-act="restoreTeam" data-id="${t.id}">${icon('RotateCcw', 14)}복구</button></div></div>`)}</div>` : empty('삭제된 팀이 없습니다')}`;
+}
+function loadStorageUsage(force = false) {
+  if (!Api.me() || !Api.canServerDetail(Api.me())) return;
+  if (!force && (ui.storage || ui.storageTried)) return;
+  if (ui.storageLoading) return;
+  ui.storageLoading = true; ui.storageTried = true;
+  Promise.resolve().then(() => Api.storageUsage()).then((r) => { ui.storage = r; ui.storageErr = null; })
+    .catch((e) => { ui.storageErr = e.message; })
+    .finally(() => { ui.storageLoading = false; if (/^#\/(status|admin)/.test(location.hash) && !ui.bootFailed && !isEditing()) render(); });
+}
+function storageMeter(s) {
+  const p = Math.min(100, (s.totalBytes / s.limitBytes) * 100);
+  return html`<div class="ed-usage ${p >= 90 ? 'over' : ''}"><div class="small">저장 파일 ${fmtSize(s.totalBytes)} / ${fmtSize(s.limitBytes)} (무료 요금제 1GB) · ${s.totalCount}개</div><div class="bar"><span style="width:${Math.max(p, s.totalBytes ? 1 : 0)}%"></span></div></div>`;
+}
+function adminStorageTab() {
+  loadStorageUsage();
+  const s = ui.storage;
+  if (!s) return html`<p class="faint small">${ui.storageErr || '불러오는 중…'}</p>`;
+  const PREFIX = { team: '팀 파일', post: '게시물 파일', cover: '대표 이미지' };
+  return html`
+  <section class="section" style="margin-top:0"><div class="section-head"><h2>저장 공간</h2><button class="btn btn-sm btn-tertiary" data-act="reloadStorage">${icon('RefreshCw', 14)}새로 불러오기</button></div>
+    ${storageMeter(s)}
+    ${s.byPrefix ? html`<div class="table-wrap" style="margin-top:12px"><table class="tbl"><thead><tr><th>구분</th><th>개수</th><th>용량</th></tr></thead><tbody>
+      ${s.byPrefix.map((x) => html`<tr><td>${PREFIX[x.prefix] || x.prefix}</td><td class="num">${x.count}</td><td class="num">${fmtSize(x.bytes)}</td></tr>`)}</tbody></table></div>` : ''}</section>
+  ${s.largest ? html`<section class="section"><div class="section-head"><h2>가장 큰 파일 ${s.largest.length}개</h2></div>
+    ${s.largest.length ? html`<div class="table-wrap"><table class="tbl"><thead><tr><th>용량</th><th>연결된 곳</th><th>경로</th></tr></thead><tbody>
+      ${s.largest.map((x) => html`<tr><td class="num" style="white-space:nowrap">${fmtSize(x.size)}</td><td class="small">${x.linked || html`<span class="badge badge-warn">연결 없음</span>`}</td><td class="mono xs" style="word-break:break-all">${x.path}</td></tr>`)}</tbody></table></div>` : emptyInline('파일이 없습니다.')}</section>
+  <section class="section"><div class="section-head"><h2>고아 파일<span class="count">${s.orphanCount ?? 0}</span></h2><span class="faint small">${fmtSize(s.orphanBytes || 0)}</span></div>
+    <p class="faint small" style="margin:-4px 0 8px">팀 파일·게시물 첨부·대표 이미지 어디에도 연결되지 않은 파일입니다(업로드만 되고 등록이 실패한 경우 등). <b>올린 지 24시간이 지난 것만</b> 지울 수 있으며, 삭제는 되돌릴 수 없습니다. 연결된 파일은 서버가 삭제를 막습니다.</p>
+    ${s.orphans.length ? html`<form id="orphForm" data-form="orphans"><div class="table-wrap"><table class="tbl"><thead><tr><th style="width:44px"></th><th>용량</th><th>올린 때</th><th>경로</th></tr></thead><tbody>
+      ${s.orphans.map((x) => html`<tr><td><label><span class="sr-only">선택</span><input type="checkbox" name="orph" value="${x.path}" ${x.deletable ? '' : raw('disabled')}></label></td><td class="num">${fmtSize(x.size)}</td>
+        <td class="small muted">${x.createdAt ? fmtDate(x.createdAt) : '—'}${x.deletable ? '' : ' (24시간 전)'}</td><td class="mono xs" style="word-break:break-all">${x.path}</td></tr>`)}</tbody></table></div>
+      <div class="row" style="margin-top:12px"><button class="btn btn-danger">${icon('Trash2', 15)}선택한 파일 삭제</button></div></form>` : emptyInline('고아 파일이 없습니다.')}</section>` : html`<p class="faint small">서버 관리자는 합계만 볼 수 있습니다.</p>`}`;
+}
+/** 관리자 대시보드의 점검 목록: 오래 연결이 없음, 백업 없음, 승인 대기, 확인 대기 */
+function healthItems(u, users) {
+  const items = []; const st = ui.serverStatus; const DAY = 86400000;
+  const age = (iso) => (Date.now() - new Date(iso).getTime()) / DAY;
+  if (isAdmin(u) && st) {
+    const ok = (st.pings || []).find((x) => x.ok);
+    if (!ok || age(ok.at) > 5) items.push({ lvl: 'warn', text: html`마지막으로 성공한 연결 확인이 ${ok ? `${Math.floor(age(ok.at))}일 전` : '기록에 없습니다'}. <b>서버가 곧 일시 정지될 수 있습니다.</b> (7일간 요청이 없으면 무료 요금제는 정지됩니다) <a class="link" href="#/status">연결 확인</a>` });
+    if (st.canBackup) {
+      if (!st.backup || age(st.backup.at) > 8 || !st.backup.ok) items.push({ lvl: 'warn', text: html`${st.backup ? `마지막 백업이 ${Math.floor(age(st.backup.at))}일 전이거나 실패했습니다.` : '백업 기록이 없습니다.'} 정기 백업 설정은 <a class="link" href="SETUP.md" target="_blank" rel="noopener">SETUP.md 의 4-2 예약 작업과 정기 점검</a>을 보세요.` });
+    }
+  }
+  const pending = users.filter((x) => x.status === 'pending').length;
+  if (pending) items.push({ lvl: 'info', text: html`가입 승인을 기다리는 사람이 <b>${pending}명</b> 있습니다. <a class="link" href="#/admin?tab=pending">승인하기</a>` });
+  const credits = (Store.db.teamCredits || []).filter((c) => c.status === 'pending' && Api.teamList({}).some((t) => t.id === c.teamId && !t.deletedAt)).length;
+  const subs = Api.teamList({}).filter((t) => t.status === 'pending_submit' && !t.deletedAt).length;
+  if (subs) items.push({ lvl: 'info', text: html`제출되어 확인을 기다리는 팀 프로젝트가 <b>${subs}개</b> 있습니다. <a class="link" href="#/teams?scope=all&status=pending_submit">보기</a>` });
+  if (credits) items.push({ lvl: 'info', text: html`팀원의 확인을 기다리는 제작자 표시가 <b>${credits}건</b> 있습니다. <a class="link" href="#/teams?scope=all">팀 프로젝트</a>` });
+  return items;
+}
+
+/* ---------- 내 데이터 내보내기 (본인 것만, ZIP) ---------- */
+const safeName = (s) => String(s || 'untitled').replace(/[\\/:*?"<>|\r\n]+/g, '_').trim().slice(0, 80) || 'untitled';
+async function exportMyData() {
+  if (!window.JSZip) throw new Error('ZIP 라이브러리를 불러오지 못했습니다(인터넷 연결 확인).');
+  const me = Api.me(); const zip = new JSZip(); const notes = [];
+  const mine = Api.listProjects({}).filter((p) => p.ownerId === me.id);
+  const used = new Set(); const uniq = (base) => { let n = base, i = 2; while (used.has(n)) n = `${base}_${i++}`; used.add(n); return n; };
+  mine.forEach((p) => { const head = Api.headOf(p); if (!head) return; const dir = `코드프로젝트/${uniq(safeName(p.title))}/`; head.files.forEach((f) => zip.file(dir + f.path, f.content)); });
+  const p2 = Api.profile(me.id);
+  p2.posts.forEach((p) => zip.file(`게시물/${uniq(safeName(p.title))}.md`, `---\n제목: ${p.title}\n게시판: ${BOARD_LABEL[p.board]}\n연도: ${p.year}\n태그: ${p.tags.join(', ')}\n작성: ${p.createdAt}\n---\n\n${p.body}\n`));
+  // 엑셀에서 열 때 =, +, -, @ 로 시작하는 칸이 수식으로 실행되지 않게 앞에 작은따옴표를 붙인다 (다른 사람이 정한 팀 이름·표기가 들어간다)
+  const csvCell = (v) => { let t = String(v ?? ''); if (t && ('=+@-' + String.fromCharCode(9, 13)).includes(t[0])) t = "'" + t; return `"${t.replace(/"/g, '""')}"`; };
+  zip.file('제작자기록.csv', '﻿' + ['팀,연도,제작자 표기,역할·기여', ...p2.credits.map(({ credit, team }) => [team.name, team.year, credit.displayName, credit.contribution].map(csvCell).join(','))].join('\r\n'));
+  zip.file('제작자기록.md', `# 확정된 제작자 기록\n\n${p2.credits.length ? p2.credits.map(({ credit, team }) => `- ${team.year}년 ${team.name}: ${credit.displayName}${credit.contribution ? ' (' + credit.contribution + ')' : ''}`).join('\n') : '(기록 없음)'}\n`);
+  // 내가 올린 팀 파일: 서명 주소로 내려받는다. 너무 크면 건너뛰고 안내한다.
+  const MAX_ONE = 25 * 1048576, MAX_ALL = 150 * 1048576; let total = 0;
+  for (const t of Api.teamList({ scope: 'mine' })) {
+    for (const f of Api.teamFilesOf(t.id)) for (const v of f.versions) {
+      if (v.uploadedBy !== me.id) continue;
+      const label = `${t.name}/${f.file.name} v${v.versionNo}`;
+      if (v.size > MAX_ONE || total + v.size > MAX_ALL) { notes.push(`- 건너뜀(용량이 커서): ${label} (${fmtSize(v.size)}) — 팀 화면에서 직접 내려받으세요.`); continue; }
+      try {
+        const res = await fetch(await FileStore.url(v.path, v.origName)); if (!res.ok) throw new Error('받지 못했습니다');
+        zip.file(`팀파일/${safeName(t.name)}/v${v.versionNo}_${safeName(v.origName || f.file.name)}`, await res.blob()); total += v.size;
+      } catch (e) { notes.push(`- 건너뜀(내려받지 못함): ${label}`); }
+    }
+  }
+  zip.file('README.txt', `${Api.settings().clubName} 내 데이터 내보내기\n이름: ${me.name} (${me.memberNo})\n만든 날: ${fmtDate(new Date().toISOString())}\n\n` +
+    `- 코드프로젝트: 내가 올린 프로젝트 ${mine.length}개의 최신 버전 파일\n- 게시물: 내가 쓴 게시물 ${p2.posts.length}개 (마크다운)\n- 제작자기록: 확정된 제작자 기록 ${p2.credits.length}건\n- 팀파일: 내가 올린 팀 파일 (용량이 큰 것은 제외)\n` +
+    (notes.length ? `\n제외된 항목\n${notes.join('\n')}\n` : ''));
+  const blob = await zip.generateAsync({ type: 'blob' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${safeName(me.name)}_내데이터.zip`;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  return notes.length;
+}
+
+/* ---------- 3단계 이벤트 ---------- */
+Object.assign(Actions, {
+  async unfeature(el) {
+    if (!confirm('우수 작업물 지정을 해제할까요?')) return;
+    await Api.unfeatureItem(el.dataset.kind, el.dataset.id); render(); toast('해제했습니다.', 'ok');
+  },
+  async restoreTeam(el) {
+    const t = Api.getTeam(el.dataset.id);
+    if (!confirm(`「${t.name}」을(를) 복구할까요?\n연결된 게시물도 함께 돌아오고 팀원에게 알림이 갑니다.`)) return;
+    await Api.restoreTeam(t.id); render(); toast('팀을 복구했습니다.', 'ok');
+  },
+  async rosterImport() {
+    const st = ui.roster; if (!st?.result) throw new Error('먼저 미리보기를 하세요.');
+    const n = st.result.rows.filter((r) => ['new', 'existing'].includes(r.status)).length;
+    if (!confirm(`${st.year}년 명단에 ${n}행을 가져올까요?\n오류·충돌·중복 행은 제외되고, 직책은 부여되지 않습니다.${st.year !== Api.currentYear() ? '\n(지난 연도라 감사 기록에 남습니다.)' : ''}`)) return;
+    const done = await Api.importRoster(st.year, st.rows);
+    ui.roster = { year: st.year, done }; render(); toast('명단을 가져왔습니다.', 'ok');
+  },
+  rosterClear() { ui.roster = null; render(); },
+  reloadStorage() { ui.storage = null; ui.storageTried = false; ui.storageErr = null; loadStorageUsage(true); render(); },
+  async exportMine() {
+    if (!confirm('내 코드 프로젝트·게시물·제작자 기록·내가 올린 팀 파일을 ZIP 으로 내려받을까요?\n파일이 많으면 시간이 걸릴 수 있습니다.')) return;
+    const skipped = await exportMyData(); toast(skipped ? `내려받았습니다. 용량이 커서 제외된 파일 ${skipped}개는 README.txt 를 보세요.` : '내려받았습니다.', 'ok');
+  },
+});
+Object.assign(Forms, {
+  hallYear(f, fd) { go(`#/hall/${fd.get('year')}`); },
+  statsYear(f, fd) { go(`#/stats?year=${fd.get('year')}`); },
+  async feature(f, fd) {
+    const v = String(fd.get('item') || ''); if (!v) throw new Error('지정할 항목을 고르세요.');
+    const i = v.indexOf(':'); await Api.featureItem(v.slice(0, i), v.slice(i + 1), fd.get('note')); render(); toast('우수 작업물로 지정했습니다.', 'ok');
+  },
+  searchAll(f, fd) {
+    const params = new URLSearchParams();
+    ['q', 'type', 'year', 'session', 'author'].forEach((k) => { if (fd.get(k)) params.set(k, fd.get(k)); });
+    go('#/search' + (params.toString() ? '?' + params : ''));
+  },
+  globalSearch(f, fd) { const q = String(fd.get('gq') || '').trim(); go('#/search' + (q ? '?q=' + encodeURIComponent(q) : '')); },
+  async sessionsBulk(f, fd) {
+    const year = Number(f.dataset.year);
+    const items = Api.sessionsOf(year).map((s) => ({ id: fd.get(`id_${s.no}`), title: fd.get(`title_${s.no}`), heldOn: fd.get(`date_${s.no}`), description: fd.get(`desc_${s.no}`) }));
+    if (year !== Api.currentYear() && !confirm('지난 연도의 차시를 고칩니다. 바뀐 차시마다 감사 기록에 남습니다. 계속할까요?')) return;
+    const n = await Api.updateSessionsBulk(year, items); go(`#/activity/${year}`); toast(n ? `차시 ${n}개를 저장했습니다.` : '바뀐 내용이 없습니다.', 'ok');
+  },
+  async rosterPreview(f, fd) {
+    const file = fd.get('file'); let text = String(fd.get('text') || '');
+    if (file && file.size) {
+      // 엑셀의 'CSV(쉼표로 분리)'는 UTF-8 이 아니라 CP949 로 저장되므로, UTF-8 로 읽히지 않으면 euc-kr(CP949)로 다시 읽는다
+      const buf = await file.arrayBuffer();
+      try { text = new TextDecoder('utf-8', { fatal: true }).decode(buf); } catch { text = new TextDecoder('euc-kr').decode(buf); }
+    }
+    const rows = parseRosterCsv(text);
+    if (!rows.length) throw new Error('가져올 행이 없습니다. 머리줄 아래에 명단을 적으세요.');
+    const year = Number(fd.get('year'));
+    const result = await Api.previewRoster(year, rows);
+    ui.roster = { year, text, rows, result }; render();
+  },
+  async orphans(f, fd) {
+    const paths = fd.getAll('orph'); if (!paths.length) throw new Error('지울 파일을 고르세요.');
+    if (!confirm(`고아 파일 ${paths.length}개를 삭제할까요?\n삭제하면 되돌릴 수 없습니다.`)) return;
+    const removed = await Api.cleanupOrphans(paths);
+    ui.storage = null; ui.storageTried = false; loadStorageUsage(true); render();
+    toast(removed < paths.length ? `${removed}개를 삭제했습니다. 나머지 ${paths.length - removed}개는 서버가 삭제를 허용하지 않았습니다.` : `${removed}개를 삭제했습니다.`, removed ? 'ok' : 'error');
+  },
+  async teamDelete(f, fd) {
+    const t = Api.getTeam(f.dataset.id);
+    if (String(fd.get('confirmName') || '').trim() !== t.name) throw new Error('팀 이름을 정확히 입력해야 삭제할 수 있습니다.');
+    await Api.deleteTeam(t.id, fd.get('reason')); toast('팀을 삭제했습니다. [관리 > 삭제된 팀]에서 복구할 수 있습니다.', 'ok'); go('#/admin?tab=deletedTeams');
+  },
+});
+
 document.addEventListener('click', (e) => {
   // 바깥을 누르면 열린 드롭다운을 닫는다
   document.querySelectorAll('details.dropdown[open]').forEach((d) => { if (!d.contains(e.target)) d.removeAttribute('open'); });
@@ -2415,8 +2831,12 @@ document.addEventListener('keydown', (e) => {
   // "/" 로 어디서든 프로젝트 검색으로 이동 (입력 중일 때는 제외)
   if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey && !/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) && !e.target.isContentEditable && Api.me()) {
     e.preventDefault();
-    const box = document.querySelector('input[name=q]');
-    if (box) box.focus(); else { go('#/'); setTimeout(() => document.querySelector('input[name=q]')?.focus(), 60); }
+    // 이 화면에 검색창(프로젝트·게시판·차시 검색)이 있으면 그것을, 없으면 위쪽 전체 검색창을 쓴다. 좁은 화면에서는 검색 화면으로 간다.
+    const box = document.querySelector('#main input[name=q]');
+    const top = document.querySelector('input[name=gq]');
+    if (box) box.focus();
+    else if (top && top.offsetParent !== null) top.focus();
+    else { go('#/search'); setTimeout(() => document.querySelector('#main input[name=q]')?.focus(), 60); }
     return;
   }
   if (e.key === 'Escape') {

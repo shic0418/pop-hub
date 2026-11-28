@@ -711,3 +711,26 @@ a.tag:hover { color: var(--accent-text); text-decoration: underline; }
 .home-block .section-head h2 { display: flex; align-items: center; gap: 6px; }
 .home-grid { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 48px; align-items: start; }
 @media (max-width: 820px) { .home-grid { grid-template-columns: 1fr; gap: 0; } .post-side { display: none; } }
+
+/* ===== 3단계: 전체 검색·통계·명예의 전당·명단 가져오기 ===== */
+.topbar-search { width: 180px; }
+.topbar-search input { height: 30px; font-size: var(--fs-sm); }
+.search-icon-btn { display: none; }
+.bar-track { display: block; height: 6px; min-width: 60px; border-radius: 3px; background: var(--bg-muted); overflow: hidden; }
+.bar-track > span { display: block; height: 100%; background: var(--text-3); border-radius: 3px; }
+.code-sample { margin: 0 0 12px; padding: 10px 12px; background: var(--bg-muted); border-radius: var(--r); font: var(--fs-sm)/1.6 var(--mono); overflow-x: auto; white-space: pre; }
+.danger-zone { border: 1px solid var(--danger); border-radius: var(--r-lg); padding: 16px; margin-top: 32px; }
+.danger-zone .section-head h2 { color: var(--danger); }
+.health-list { display: grid; gap: 8px; margin-bottom: 20px; }
+.chip-row { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.hall-chip { gap: 6px; }
+.gen-block { margin-bottom: 16px; }
+.tbl code, .callout code, p code { font-family: var(--mono); font-size: .92em; background: var(--bg-muted); padding: 1px 4px; border-radius: var(--r-sm); }
+@media (max-width: 1024px) { .topbar-search { width: 140px; } }
+@media (max-width: 820px) {
+  .topbar-search { display: none; }
+  .search-icon-btn { display: inline-flex; }
+  .danger-zone { padding: 12px; }
+  .toolbar select, .toolbar .search-field { max-width: 100%; }
+  .stat-tabs { overflow-x: auto; }
+}

@@ -57,16 +57,16 @@ create table auth.identities (id uuid primary key default gen_random_uuid(), use
       finally { await db.exec('reset role'); }
     }));
     function from(table) {
-      const st = { cols: '*', where: [], params: [], order: '', single: false, limit: '' };
+      const st = { cols: '*', where: [], params: [], order: [], single: false, limit: '' };
       const b = {
         select(c) { st.cols = c; return b; },
         eq(c, v) { st.params.push(v); st.where.push(`${c} = $${st.params.length}`); return b; },
         in(c, vs) { st.params.push(vs); st.where.push(`${c}::text = any($${st.params.length}::text[])`); return b; },
-        order(c, o) { st.order = ` order by ${c} ${o?.ascending === false ? 'desc' : 'asc'}`; return b; },
+        order(c, o) { st.order.push(`${c} ${o?.ascending === false ? 'desc' : 'asc'}`); return b; },   // order() 를 여러 번 부르면 정렬 열이 이어진다
         range(a, z) { st.limit = ` offset ${a} limit ${z - a + 1}`; return b; },
         single() { st.single = true; return b; },
         then(res, rej) {
-          const sql = `select ${st.cols} from public.${table}${st.where.length ? ' where ' + st.where.join(' and ') : ''}${st.order}${st.limit}`;
+          const sql = `select ${st.cols} from public.${table}${st.where.length ? ' where ' + st.where.join(' and ') : ''}${st.order.length ? ' order by ' + st.order.join(', ') : ''}${st.limit}`;
           return run(sql, st.params).then((r) => (st.single ? { data: r.data?.[0] ?? null, error: r.error || (r.data?.length ? null : { message: 'no rows' }) } : r)).then(res, rej);
         },
       };
@@ -105,6 +105,16 @@ create table auth.identities (id uuid primary key default gen_random_uuid(), use
             const r = await run(`insert into storage.objects (bucket_id, name, metadata) values ($1, $2, $3)`, [bucket, path, { size: file.size, mimetype: file.type }]);
             if (r.error) return { data: null, error: { message: /duplicate/i.test(r.error.message) ? 'The resource already exists' : r.error.message } };
             blobs.set(path, file); return { data: { path }, error: null };
+          },
+          async remove(paths) {
+            // 삭제도 진짜 schema.sql 의 Storage 삭제 정책이 적용된다 (정책이 거르면 행이 지워지지 않는다)
+            const gone = [];
+            for (const path of paths) {
+              const r = await run(`delete from storage.objects where bucket_id = $1 and name = $2 returning name`, [bucket, path]);
+              if (r.error) return { data: null, error: { message: r.error.message } };
+              if (r.data.length) { blobs.delete(path); gone.push({ name: path }); }
+            }
+            return { data: gone, error: null };
           },
           async createSignedUrl(path) {
             const r = await run(`select 1 from storage.objects where bucket_id = $1 and name = $2`, [bucket, path]);

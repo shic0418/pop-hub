@@ -227,3 +227,30 @@ function renderMarkdown(md) {
   }
   return html`<pre class="plain">${md}</pre>`;
 }
+
+/* ---------- CSV (명단 가져오기) ---------- */
+/** CSV 글자 → 2차원 배열. 따옴표("")·줄바꿈 포함 칸·BOM·CRLF 를 처리한다 */
+function parseCsv(text) {
+  text = String(text || '').replace(/^﻿/, '');
+  const rows = []; let row = [], cell = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += c;
+    } else if (c === '"' && cell === '') q = true;
+    else if (c === ',') { row.push(cell); cell = ''; }
+    else if (c === '\n' || c === '\r') { if (c === '\r' && text[i + 1] === '\n') i++; row.push(cell); cell = ''; rows.push(row); row = []; }
+    else cell += c;
+  }
+  if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+  return rows.filter((r) => r.some((x) => String(x).trim() !== ''));
+}
+const ROSTER_HEADERS = { '이름': 'name', '기수': 'generation', '학년': 'grade', '이메일': 'email', '회원번호': 'member_no', '직책': 'note' };
+/** 머리줄(이름,기수,학년,이메일,회원번호,직책)을 읽어 행 객체 배열로. 이름 열이 없으면 오류 */
+function parseRosterCsv(text) {
+  const rows = parseCsv(text);
+  if (!rows.length) throw new Error('CSV 내용이 비어 있습니다.');
+  const head = rows[0].map((h) => ROSTER_HEADERS[String(h).trim()] || null);
+  if (!head.includes('name')) throw new Error('첫 줄에 "이름" 열이 있어야 합니다. 예: 이름,기수,학년,이메일,회원번호,직책');
+  return rows.slice(1).map((r) => { const o = {}; head.forEach((k, i) => { if (k) o[k] = String(r[i] ?? '').trim(); }); return o; });
+}
