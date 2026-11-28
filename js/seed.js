@@ -257,7 +257,7 @@ box.addEventListener('click', () => {
   return ensureV2Tables({
     schema: SCHEMA,
     settings: {
-      clubName: '코딩 동아리', domain, signupMode: 'approval', maxFileKB: 2048,
+      clubName: '코딩 동아리', domain, signupMode: 'approval', maxFileKB: 2048, maxUploadMB: 20,
       whitelist: ['newbie@' + domain],
     },
     session: { userId: null },
@@ -282,6 +282,22 @@ box.addEventListener('click', () => {
       { id: 'n3', userId: 'u_sihu', text: '하은(haeun@example.hs.kr) 님이 가입 승인을 기다립니다.', link: '#/admin?tab=pending', read: false, createdAt: ago(1) },
       { id: 'n4', userId: 'u_teacher', text: '하은(haeun@example.hs.kr) 님이 가입 승인을 기다립니다.', link: '#/admin?tab=pending', read: false, createdAt: ago(1) },
     ],
+    // 2단계 예시: 팀 프로젝트 하나와 게시물 두 개 (데모 파일 저장은 브라우저 안에만 된다)
+    teams: [{ id: 't_robot', name: '로봇 청소기 팀', description: '교실 바닥을 청소하는 작은 로봇을 만듭니다.', goal: '2학기 발표회까지 동작하는 시제품 완성',
+      leader: 'u_minjun', year: operatingYear(), coverPath: null, status: 'active', publishedAt: null, createdAt: ago(20), updatedAt: ago(2), deletedAt: null }],
+    teamMembers: [
+      { teamId: 't_robot', memberId: 'u_minjun', roleLabel: '팀장', status: 'active', invitedBy: 'u_minjun', invitedAt: ago(20), joinedAt: ago(20) },
+      { teamId: 't_robot', memberId: 'u_seoyeon', roleLabel: '설계', status: 'active', invitedBy: 'u_minjun', invitedAt: ago(19), joinedAt: ago(18) },
+      { teamId: 't_robot', memberId: 'u_jiho', roleLabel: '코드', status: 'invited', invitedBy: 'u_minjun', invitedAt: ago(1), joinedAt: null },
+    ],
+    teamNotes: [{ id: 'tn1', teamId: 't_robot', author: 'u_minjun', kind: 'progress', body: '모터 드라이버 부품을 주문했습니다. 도착하면 배선을 시작합니다.', pinned: false, createdAt: ago(2) }],
+    posts: [
+      { id: 'po_notice', author: 'u_teacher', board: 'notice', title: '이번 학기 동아리 운영 안내', body: '## 안내\n\n- 매주 수요일 7교시에 모입니다.\n- 결과물은 **차시**별로 정리해 주세요.\n- 팀 프로젝트는 [팀 프로젝트] 메뉴에서 만들 수 있습니다.',
+        tags: ['안내'], visibility: 'members', coverPath: null, teamId: null, projectId: null, year: operatingYear(), pinned: true, hidden: false, createdAt: ago(5), updatedAt: ago(5), deletedAt: null },
+      { id: 'po_free', author: 'u_jiho', board: 'free', title: '심심해서 만든 타자 연습', body: '개인 프로젝트로 **타자 연습** 게임을 만들어 봤어요. 의견 주세요!', tags: ['게임', '개인작'], visibility: 'members',
+        coverPath: null, teamId: null, projectId: 'p_game', year: operatingYear(), pinned: false, hidden: false, createdAt: ago(3), updatedAt: ago(3), deletedAt: null },
+    ],
+    postReactions: [{ postId: 'po_free', memberId: 'u_minjun' }, { postId: 'po_free', memberId: 'u_seoyeon' }],
     // 로그인 계정 ↔ 회원 (데모에서는 회원마다 계정 하나)
     accounts: users.map((u) => ({ authId: 'au_' + u.id, memberId: u.id, email: u.email, status: 'active', linkedAt: u.createdAt })),
   });

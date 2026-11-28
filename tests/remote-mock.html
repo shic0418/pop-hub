@@ -28,7 +28,15 @@
       create table auth.users (id uuid primary key default gen_random_uuid(), email text, raw_user_meta_data jsonb default '{}', raw_app_meta_data jsonb default '{"provider":"google"}', email_confirmed_at timestamptz default now());
 create table auth.identities (id uuid primary key default gen_random_uuid(), user_id uuid, provider text);
       create function auth.uid() returns uuid language sql stable as $$ select nullif(current_setting('test.uid', true), '')::uuid $$;
-      grant usage on schema auth to anon, authenticated; grant execute on function auth.uid() to anon, authenticated;`);
+      grant usage on schema auth to anon, authenticated; grant execute on function auth.uid() to anon, authenticated;
+      -- Storage 흉내 (정책에 필요한 부분만). 실제 파일 내용은 아래 blobs 에 둔다.
+      create schema storage;
+      create table storage.buckets (id text primary key, name text, public boolean default false, file_size_limit bigint);
+      create table storage.objects (id uuid primary key default gen_random_uuid(), bucket_id text, name text, owner uuid, metadata jsonb, created_at timestamptz default now());
+      alter table storage.objects enable row level security;
+      create unique index on storage.objects (bucket_id, name);
+      grant usage on schema storage to anon, authenticated; grant select, insert, update, delete on storage.objects to authenticated;`);
+    const blobs = new Map();
     await db.exec(await (await fetch('../supabase/schema.sql')).text());
     await db.exec(`update settings set domain = 'school.hs.kr', club_name = '모의 동아리';
       update private_settings set teacher_emails = array['t@school.hs.kr'], whitelist = array['a@school.hs.kr', 'b@school.hs.kr', 'sv@school.hs.kr'];`);
@@ -69,6 +77,7 @@ create table auth.identities (id uuid primary key default gen_random_uuid(), use
       const vals = keys.map((k) => params[k]);
       const args = keys.map((k, i) => {
         const v = vals[i];
+        if (Array.isArray(v) && /_ids$/.test(k)) return `${k} => $${i + 1}::uuid[]`;
         if (Array.isArray(v) && v.every((x) => typeof x === 'string')) return `${k} => $${i + 1}::text[]`;
         if (v && typeof v === 'object') { vals[i] = JSON.stringify(v); return `${k} => $${i + 1}::jsonb`; }
         if (typeof v === 'boolean') return `${k} => $${i + 1}::boolean`;
@@ -90,11 +99,25 @@ create table auth.identities (id uuid primary key default gen_random_uuid(), use
           signInWithOAuth: async () => ({ error: { message: '모의 환경: window.mockLogin(이메일) 을 쓰세요' } }),
         },
         from, rpc,
+        // supabase.storage.from(bucket).upload / createSignedUrl 흉내 (접근 정책은 진짜 schema.sql 의 것이 적용된다)
+        storage: { from: (bucket) => ({
+          async upload(path, file) {
+            const r = await run(`insert into storage.objects (bucket_id, name, metadata) values ($1, $2, $3)`, [bucket, path, { size: file.size, mimetype: file.type }]);
+            if (r.error) return { data: null, error: { message: /duplicate/i.test(r.error.message) ? 'The resource already exists' : r.error.message } };
+            blobs.set(path, file); return { data: { path }, error: null };
+          },
+          async createSignedUrl(path) {
+            const r = await run(`select 1 from storage.objects where bucket_id = $1 and name = $2`, [bucket, path]);
+            if (r.error || !r.data.length || !blobs.has(path)) return { data: null, error: { message: 'Object not found' } };
+            return { data: { signedUrl: URL.createObjectURL(blobs.get(path)) }, error: null };
+          },
+        }) },
       }),
     };
     window.mockLogin = async (email) => { uid = users[email]; await Remote.refresh(); render(); };
     window.mockUsers = users;
     window.mockDb = db;
+    window.mockBlobs = blobs;
     window.APP_CONFIG = { supabaseUrl: 'mock', supabaseAnonKey: 'mock' };
     for (const src of ['../js/util.js', '../js/seed.js', '../js/store.js', '../js/remote.js', '../js/app.js']) {
       await new Promise((ok, no) => { const s = document.createElement('script'); s.src = src; s.onload = ok; s.onerror = no; document.body.appendChild(s); });

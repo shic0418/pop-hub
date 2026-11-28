@@ -70,7 +70,18 @@ const Remote = (() => {
   const mapYear = (r) => ({ year: r.year, startsOn: day(r.starts_on), endsOn: day(r.ends_on), status: r.status });
   const mapSession = (r) => ({ id: r.id, year: r.year, no: r.no, title: r.title, heldOn: day(r.held_on), description: r.description });
   const mapMembership = (r) => ({ memberId: r.member_id, year: r.year, generation: r.generation, grade: r.grade, roles: r.roles || [], status: r.status });
-  const mapReport = (r) => ({ id: r.id, projectId: r.project_id, reporterId: r.reporter_id, reason: r.reason, status: r.status, action: r.action, resolvedBy: r.resolved_by, resolvedAt: ts(r.resolved_at), createdAt: ts(r.created_at) });
+  const mapReport = (r) => ({ id: r.id, projectId: r.project_id, postId: r.post_id, reporterId: r.reporter_id, reason: r.reason, status: r.status, action: r.action, resolvedBy: r.resolved_by, resolvedAt: ts(r.resolved_at), createdAt: ts(r.created_at) });
+  // [2단계] 팀 프로젝트·게시판
+  const mapTeam = (r) => ({ id: r.id, name: r.name, description: r.description, goal: r.goal, leader: r.leader, year: r.year, coverPath: r.cover_path, status: r.status, publishedAt: ts(r.published_at), createdAt: ts(r.created_at), updatedAt: ts(r.updated_at), deletedAt: ts(r.deleted_at) });
+  const mapTeamMember = (r) => ({ teamId: r.team_id, memberId: r.member_id, roleLabel: r.role_label, status: r.status, invitedBy: r.invited_by, invitedAt: ts(r.invited_at), joinedAt: ts(r.joined_at) });
+  const mapTeamFile = (r) => ({ id: r.id, teamId: r.team_id, name: r.name, createdBy: r.created_by, createdAt: ts(r.created_at) });
+  const mapTeamVersion = (r) => ({ id: r.id, fileId: r.file_id, versionNo: r.version_no, origName: r.orig_name, path: r.path, size: Number(r.size), mime: r.mime, note: r.note, uploadedBy: r.uploaded_by, uploadedAt: ts(r.uploaded_at) });
+  const mapTeamNote = (r) => ({ id: r.id, teamId: r.team_id, author: r.author, kind: r.kind, body: r.body, pinned: r.pinned, createdAt: ts(r.created_at) });
+  const mapTeamCredit = (r) => ({ teamId: r.team_id, memberId: r.member_id, displayName: r.display_name, contribution: r.contribution, status: r.status, confirmedAt: ts(r.confirmed_at) });
+  const mapCreditHistory = (r) => ({ id: r.id, teamId: r.team_id, actor: r.actor, change: r.change || {}, at: ts(r.at) });
+  const mapPost = (r) => ({ id: r.id, author: r.author, board: r.board, title: r.title, body: r.body, tags: r.tags || [], visibility: r.visibility, coverPath: r.cover_path, teamId: r.team_id, projectId: r.project_id, year: r.year, pinned: r.pinned, hidden: r.hidden, createdAt: ts(r.created_at), updatedAt: ts(r.updated_at), deletedAt: ts(r.deleted_at) });
+  const mapPostFile = (r) => ({ id: r.id, postId: r.post_id, path: r.path, name: r.name, size: Number(r.size), mime: r.mime, createdAt: ts(r.created_at) });
+  const mapPostComment = (r) => ({ id: r.id, postId: r.post_id, author: r.author, body: r.body, createdAt: ts(r.created_at), deletedAt: ts(r.deleted_at) });
 
   /* ---------- 서버에서 전체 다시 읽기 ---------- */
   // 동시에 여러 번 불려도 가장 나중에 시작한 결과만 반영한다 (늦게 끝난 옛 결과가 덮어쓰지 않게)
@@ -91,10 +102,11 @@ const Remote = (() => {
     if (se) throw new ApiError(cleanError(se.message));
     const db = {
       schema: SCHEMA, session: { userId: null, authId: uid },
-      settings: { clubName: s.club_name, domain: s.domain, signupMode: s.signup_mode, maxFileKB: s.max_file_kb, whitelist: [] },
+      settings: { clubName: s.club_name, domain: s.domain, signupMode: s.signup_mode, maxFileKB: s.max_file_kb, maxUploadMB: s.max_upload_mb ?? 20, whitelist: [] },
       users: [], projects: [], versions: [], mergeRequests: [], forkRequests: [], comments: [], contributors: [], notifications: [], reports: [],
       accounts: [], invites: [], rolePerms: [], ownerTransfers: [], auditLogs: [], years: [], sessions: [], membership: [], projectSessions: [],
     };
+    ensureV3Tables(db);
     if (uid) {
       const [profiles, emails, priv, projects, skeleton, versionIds, mrs, frs, comments, contribs, notis, reports,
         accounts, invites, userRoles, perms, transfers, audits, years, sessions, membership, projectSessions] = await Promise.all([
@@ -110,6 +122,20 @@ const Remote = (() => {
         fetchAll('academic_years', '*', undefined, 'year'), fetchAll('sessions'), fetchAll('membership_history', '*', undefined, 'member_id'),
         fetchAll('project_sessions', '*', undefined, 'project_id'),
       ]);
+      // [2단계] 팀 프로젝트·게시판 표 (볼 수 있는 행만 서버가 걸러 준다)
+      const [teams, tMembers, tFiles, tVers, tNotes, tCredits, tHist, tSess, tFinal, posts, pSess, pFiles, pComments, pReacts] = await Promise.all([
+        fetchAll('team_projects'), fetchAll('team_members', '*', undefined, 'team_id'), fetchAll('team_files'), fetchAll('team_file_versions'), fetchAll('team_notes'),
+        fetchAll('team_credits', '*', undefined, 'team_id'), fetchAll('team_credit_history'), fetchAll('team_project_sessions', '*', undefined, 'team_id'),
+        fetchAll('team_final_files', '*', undefined, 'team_id'), fetchAll('posts'), fetchAll('post_sessions', '*', undefined, 'post_id'),
+        fetchAll('post_files'), fetchAll('post_comments'), fetchAll('post_reactions', '*', undefined, 'post_id'),
+      ]);
+      db.teams = teams.map(mapTeam); db.teamMembers = tMembers.map(mapTeamMember); db.teamFiles = tFiles.map(mapTeamFile);
+      db.teamVersions = tVers.map(mapTeamVersion); db.teamNotes = tNotes.map(mapTeamNote); db.teamCredits = tCredits.map(mapTeamCredit);
+      db.teamCreditHistory = tHist.map(mapCreditHistory); db.teamSessions = tSess.map((r) => ({ teamId: r.team_id, sessionId: r.session_id }));
+      db.teamFinal = tFinal.map((r) => ({ teamId: r.team_id, versionId: r.file_version_id }));
+      db.posts = posts.map(mapPost); db.postSessions = pSess.map((r) => ({ postId: r.post_id, sessionId: r.session_id }));
+      db.postFiles = pFiles.map(mapPostFile); db.postComments = pComments.map(mapPostComment);
+      db.postReactions = pReacts.map((r) => ({ postId: r.post_id, memberId: r.member_id }));
       const emailOf = new Map(emails.map((e) => [e.user_id, e.email]));
       const rolesOf = new Map();
       for (const r of userRoles) { if (!rolesOf.has(r.member_id)) rolesOf.set(r.member_id, []); rolesOf.get(r.member_id).push(r.role); }
@@ -171,7 +197,7 @@ const Remote = (() => {
     setUserGeneration: (id, gen) => rpc('set_user_generation', { p_id: id, p_generation: num(gen) }),
     updateSettings: (p) => rpc('update_settings', {
       p_club_name: p.clubName ?? null, p_domain: p.domain ?? null, p_signup_mode: p.signupMode ?? null,
-      p_max_file_kb: num(p.maxFileKB), p_whitelist: p.whitelist ?? null,
+      p_max_file_kb: num(p.maxFileKB), p_whitelist: p.whitelist ?? null, p_max_upload_mb: num(p.maxUploadMB),
     }),
     createProject: (o) => rpc('create_project', {
       p_title: o.title, p_description: o.description || '', p_permission: o.permission,
@@ -209,8 +235,45 @@ const Remote = (() => {
     unlinkProjectSession: (projectId, sessionId) => rpc('unlink_project_session', { p_project_id: projectId, p_session_id: sessionId }),
     upsertMembership: (memberId, year, gen, grade) => rpc('upsert_membership', { p_member_id: memberId, p_year: Number(year), p_generation: num(gen), p_grade: num(grade) }),
     ensureAcademicYear: () => rpc('ensure_academic_year', {}),
+    // 2단계: 팀 프로젝트
+    createTeam: (o) => rpc('create_team', { p_name: o.name, p_description: o.description || '', p_goal: o.goal || '' }),
+    updateTeam: (id, o) => rpc('update_team', { p_id: id, p_name: o.name ?? null, p_description: o.description ?? null, p_goal: o.goal ?? null, p_cover_path: o.coverPath ?? null }),
+    inviteTeamMember: (id, member, label) => rpc('invite_team_member', { p_team: id, p_member: member, p_role_label: label || '' }),
+    respondTeamInvite: (id, accept) => rpc('respond_team_invite', { p_team: id, p_accept: !!accept }),
+    removeTeamMember: (id, member) => rpc('remove_team_member', { p_team: id, p_member: member }),
+    leaveTeam: (id) => rpc('leave_team', { p_team: id }),
+    transferTeamLeader: (id, member) => rpc('transfer_team_leader', { p_team: id, p_member: member }),
+    setTeamStatus: (id, status) => rpc('set_team_status', { p_team: id, p_status: status }),
+    registerTeamFile: (id, o) => rpc('register_team_file', { p_team: id, p_path: o.path, p_name: o.name, p_note: o.note || '', p_file_id: o.fileId || null }),
+    setTeamFinal: (id, versionId, final) => rpc('set_team_final', { p_team: id, p_version: versionId, p_final: !!final }),
+    addTeamNote: (id, kind, body) => rpc('add_team_note', { p_team: id, p_kind: kind, p_body: body }),
+    deleteTeamNote: (id) => rpc('delete_team_note', { p_id: id }),
+    pinTeamNote: (id, pinned) => rpc('pin_team_note', { p_id: id, p_pinned: !!pinned }),
+    setTeamCredits: (id, list) => rpc('set_team_credits', { p_team: id, p_credits: list.map((c) => ({ member_id: c.memberId, display_name: c.displayName, contribution: c.contribution || '' })) }),
+    respondTeamCredit: (id, confirm) => rpc('respond_team_credit', { p_team: id, p_confirm: !!confirm }),
+    linkTeamSession: (id, sid) => rpc('link_team_session', { p_team: id, p_session: sid }),
+    unlinkTeamSession: (id, sid) => rpc('unlink_team_session', { p_team: id, p_session: sid }),
+    publishTeam: (id) => rpc('publish_team', { p_team: id }),
+    // 2단계: 게시판
+    createPost: (o) => rpc('create_post', { p_board: o.board, p_title: o.title, p_body: o.body || '', p_tags: o.tags || [], p_visibility: o.visibility || 'members',
+      p_team_id: o.teamId || null, p_project_id: o.projectId || null, p_session_ids: o.sessionIds || [], p_pinned: !!o.pinned }),
+    updatePost: (id, o) => rpc('update_post', { p_id: id, p_title: o.title, p_body: o.body || '', p_tags: o.tags || [], p_visibility: o.visibility || 'members',
+      p_project_id: o.projectId || null, p_session_ids: o.sessionIds || [] }),
+    deletePost: (id) => rpc('delete_post', { p_id: id }),
+    setPostHidden: (id, hidden) => rpc('set_post_hidden', { p_id: id, p_hidden: !!hidden }),
+    setPostPinned: (id, pinned) => rpc('set_post_pinned', { p_id: id, p_pinned: !!pinned }),
+    registerPostFile: (postId, o) => rpc('register_post_file', { p_post: postId, p_path: o.path, p_name: o.name, p_cover: !!o.cover }),
+    removePostFile: (id) => rpc('remove_post_file', { p_id: id }),
+    addPostComment: (postId, body) => rpc('add_post_comment', { p_post: postId, p_body: body }),
+    deletePostComment: (id) => rpc('delete_post_comment', { p_id: id }),
+    togglePostReaction: (postId) => rpc('toggle_post_reaction', { p_post: postId }),
+    reportPost: (postId, reason) => rpc('report_post', { p_id: postId, p_reason: reason }),
   };
-  const returnsProject = new Set(['createProject', 'forkProject']);
+  // 서버가 새 행의 ID 만 돌려주는 함수는, 다시 읽은 뒤 화면 코드가 쓰는 객체(데모 모드와 같은 모양)로 바꿔 돌려준다
+  const returnsObject = {
+    createProject: (id) => Api.rawProject(id) || { id }, forkProject: (id) => Api.rawProject(id) || { id },
+    createTeam: (id) => Api.getTeam(id), createPost: (id) => Api.rawPost(id) || { id }, publishTeam: (id) => Api.rawPost(id) || { id },
+  };
 
   function installApi() {
     for (const [name, fn] of Object.entries(writes)) {
@@ -218,13 +281,33 @@ const Remote = (() => {
         const result = await fn(...args);
         // 저장은 이미 끝났으므로, 다시 읽기가 실패해도 오류로 보고하지 않는다 (재시도로 중복 생성되는 것 방지)
         try { await refresh(); } catch (e) { console.warn('저장 후 새로고침 실패', e); }
-        return returnsProject.has(name) ? (Api.rawProject(result) || { id: result }) : result;
+        return returnsObject[name] ? returnsObject[name](result) : result;
       };
     }
     Api.login = () => { throw new ApiError('Google 로그인 버튼을 이용하세요.'); };
     Api.logout = async () => { await client.auth.signOut(); versionCache.clear(); ensuredFor = null; await refresh(); };
     Api.ping = ping;
     Api.serverStatus = serverStatus;
+    // 파일은 Supabase Storage(비공개 버킷 pop-files)에 올린다. 덮어쓰기는 하지 않고(upsert:false), 열람은 60초짜리 서명 주소로만 한다.
+    FileStore.limitBytes = () => (Store.db?.settings?.maxUploadMB || 20) * 1048576;
+    FileStore.put = async (path, file) => {
+      const { error } = await client.storage.from('pop-files').upload(path, file, { upsert: false, contentType: file.type || undefined, cacheControl: '3600' });
+      if (error) throw new ApiError(storageError(error.message));
+      return { size: file.size, mime: file.type || '' };
+    };
+    FileStore.url = async (path, downloadName) => {
+      const { data, error } = await client.storage.from('pop-files').createSignedUrl(path, 60, downloadName ? { download: downloadName } : undefined);
+      if (error || !data?.signedUrl) throw new ApiError(storageError(error?.message || '파일 주소를 만들지 못했습니다.'));
+      return data.signedUrl;
+    };
+  }
+  function storageError(msg) {
+    msg = String(msg || '');
+    if (/row-level security|not authorized|Unauthorized/i.test(msg)) return '이 위치에 파일을 올리거나 열 권한이 없습니다.';
+    if (/already exists|Duplicate/i.test(msg)) return '같은 경로의 파일이 이미 있습니다. 다시 시도해 주세요.';
+    if (/exceed|too large|maximum/i.test(msg)) return '파일이 너무 큽니다. 업로드 용량 제한을 확인하세요.';
+    if (/not found|Object not found/i.test(msg)) return '파일을 찾을 수 없습니다.';
+    return cleanError(msg);
   }
 
   /* ---------- 서버 상태 ---------- */

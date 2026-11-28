@@ -153,8 +153,23 @@ select private.emergency_grant_owner('POP-0001');   -- 해당 회원 번호의 �
 ```
 회원 번호는 `select member_no, name from public.profiles;` 로 찾을 수 있습니다. 그 회원이 쓸 Google 계정이 연결돼 있어야 하므로, 새 계정이면 먼저 로그인해 가입한 뒤 `user_accounts` 연결을 확인하세요. 평소에는 관리자가 Google 계정을 2개 이상 연결해 두는 것을 권장합니다.
 
+## 4-4. 파일 저장소(Storage)와 2단계 기능 (v2.1)
+팀 프로젝트 파일, 게시물 첨부·대표 이미지는 **Supabase Storage** 의 **비공개 버킷 `pop-files`** 에 저장합니다. DB 에는 경로·크기·종류만 기록합니다.
+
+- **만들기**: `supabase/schema.sql` 을 SQL Editor 에서 다시 실행하면 버킷(`pop-files`, 비공개)과 접근 정책이 자동으로 만들어집니다. 따로 만들 것은 없습니다. (이미 있으면 그대로 두고 비공개로만 맞춥니다. 몇 번 실행해도 안전합니다.)
+  - 확인: 대시보드 **Storage → Buckets** 에 `pop-files` 가 있고 **Public** 이 꺼져 있어야 합니다. **Policies** 에 `pop_files_insert`, `pop_files_select` 두 개가 보여야 합니다.
+  - 정책을 만들 권한이 없다는 안내(NOTICE)가 나오면 같은 이름·같은 조건으로 대시보드에서 직접 만드세요(조건은 `schema.sql` 의 `pop_files_*` 부분 참고).
+- **경로 규칙**: `team/<팀ID>/<uuid>-<파일이름>`, `post/<게시물ID>/<uuid>-<파일이름>`, `cover/team/<팀ID>/<uuid>.<확장자>`. 영문·숫자만 쓰도록 정리한 이름이며, 한글 등 원래 이름은 DB 에 따로 기록합니다.
+- **열람 규칙**(서버가 검사): 팀 파일 = 팀원·운영진(게시된 팀의 **최종본**은 전체 부원). 게시물 첨부 = 그 게시물을 볼 수 있는 사람. 서버 관리자 직책은 아무 추가 권한이 없습니다. 내려받기는 **60초짜리 서명 주소**로만 합니다.
+- **덮어쓰기·삭제 금지**: 수정·삭제 정책을 일부러 만들지 않았습니다. 같은 파일을 다시 올리면 새 버전으로 쌓입니다. 화면에서 "빼기"는 DB 목록에서만 빼며, 저장소의 실제 파일은 남습니다.
+- **파일 지우기(관리자만)**: Supabase 대시보드 **Storage → pop-files** 에서 파일(또는 폴더)을 골라 **Delete** 합니다. 지우기 전에 DB 의 기록(`team_file_versions.path`, `post_files.path`)이 남아 있으면 그 파일은 "찾을 수 없음"으로 보입니다. 정말 지울 파일만 지우세요.
+- **업로드 한도**: 관리 → 설정의 **팀·게시판 파일 업로드 제한(MB)** (기본 **20MB**, 1~50MB). 서버가 파일을 등록할 때 실제 크기를 다시 검사합니다. 무료 요금제 Storage 는 전체 1GB, 파일당 최대 50MB 입니다. 큰 파일은 외부 링크로 안내하세요.
+- **막는 형식**: `exe, bat, cmd, com, msi, scr, ps1, vbs, dll, sh, jar, apk, app, dmg` (서버가 거절하며, 화면에서도 미리 막습니다). 올린 파일은 앱 안에서 실행하지 않고 내려받기만 합니다.
+- **데모 모드**: 서버가 없으므로 파일을 이 브라우저(localStorage)에 data URL 로 저장하고, 저장 공간이 작아 **1MB까지만** 올릴 수 있습니다(화면에 안내).
+- **기존 서버 적용**: 4-1 의 백업을 한 뒤 새 `schema.sql` 을 실행합니다. 새 표(`team_*`, `post_*`)와 `settings.max_upload_mb` 가 추가되고, 기존 데이터는 바뀌지 않습니다. `reports` 표에는 `post_id` 칸이 생겨 게시물 신고도 같은 표에 쌓입니다(기존 코드 프로젝트 신고는 그대로). `update_settings` 함수는 인자가 늘어 예전 형태를 먼저 지운 뒤 다시 만듭니다.
+
 ## 5. 알아 둘 점
-- **코드 저장 위치**: 코드 파일은 DB의 `versions.files`(JSON)에 저장합니다. 기획서의 Supabase Storage 대신입니다.
+- **코드 저장 위치**: 코드 파일은 DB의 `versions.files`(JSON)에 저장합니다. (팀 파일·게시물 첨부는 4-4 의 Supabase Storage 를 씁니다.)
   - 파일당 용량 제한(기본 2MB, 관리 화면에서 최대 10MB까지)과 프로젝트당 10MB 제한이 있습니다.
   - 버전마다 파일 전체를 저장하므로, 큰 프로젝트를 자주 고치면 무료 DB 용량(500MB)이 빨리 찹니다.
   - 무료 DB 용량 500MB면 동아리 규모에서 충분합니다.
@@ -172,13 +187,13 @@ select private.emergency_grant_owner('POP-0001');   -- 해당 회원 번호의 �
   - 데이터가 아주 많아지면 "버전 이력은 열 때 받기"로 바꾸는 것을 권합니다.
 
 ## 6. 개발자용 테스트
-- `tests/schema-test.mjs`: 서버 SQL의 권한 규칙 278가지를 로컬 Postgres(PGlite)로 검사합니다. 직책·계정 연결·운영 연도·서버 상태, 옛 구조 DB 의 마이그레이션(두 번 적용해도 안전)까지 포함합니다.
+- `tests/schema-test.mjs`: 서버 SQL의 권한 규칙 **538가지**를 로컬 Postgres(PGlite)로 검사합니다. 직책·계정 연결·운영 연도·서버 상태, 옛 구조 DB 의 마이그레이션(두 번 적용해도 안전)에 더해 2단계의 Storage 정책(가짜 `storage` 스키마로 실제 정책을 실행), 팀 프로젝트·제작자 확인 흐름·게시판·공지·과거 연도 읽기 전용까지 포함합니다.
   ```
   npm install @electric-sql/pglite
   node tests/schema-test.mjs
   ```
 - `tests/remote-mock.html`: Supabase 없이 서버 모드 화면을 시험하는 페이지입니다.
-  - 브라우저 안 Postgres에 같은 `schema.sql`을 올립니다.
+  - 브라우저 안 Postgres에 같은 `schema.sql`을 올립니다. Storage 도 `upload`/`createSignedUrl` 만 흉내 내며, 접근 정책은 진짜 `schema.sql` 의 것이 적용됩니다.
   - `http://localhost:5173/tests/remote-mock.html`을 열고, 개발자 도구 콘솔에서 `mockLogin('a@school.hs.kr')` 등으로 로그인합니다.
 
 ## 7. Google 앱 "게시" (부원 전체가 로그인하려면 필수)

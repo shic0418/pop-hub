@@ -26,6 +26,10 @@ insert into public.settings (id) values (1) on conflict do nothing;
 -- 이미 만들어진 DB 에서도 새 용량 범위(최대 10MB)가 적용되도록 제약을 다시 건다
 alter table public.settings drop constraint if exists settings_max_file_kb_check;
 alter table public.settings add constraint settings_max_file_kb_check check (max_file_kb between 1 and 10240);
+-- [v2.1] 팀·게시판 파일 업로드 한도(MB). Storage 파일에 적용된다.
+alter table public.settings add column if not exists max_upload_mb int not null default 20;
+alter table public.settings drop constraint if exists settings_max_upload_mb_check;
+alter table public.settings add constraint settings_max_upload_mb_check check (max_upload_mb between 1 and 50);
 
 -- 명단·부장 이메일은 운영진만 볼 수 있도록 따로 둔다
 create table if not exists public.private_settings (
@@ -788,9 +792,11 @@ begin
   if not found then raise exception '사용자가 없습니다.'; end if;
 end $$;
 
+-- 인자가 늘어 예전 함수와 겹치지 않도록 먼저 지운다
+drop function if exists public.update_settings(text, text, text, int, text[]);
 create or replace function public.update_settings(
   p_club_name text default null, p_domain text default null, p_signup_mode text default null,
-  p_max_file_kb int default null, p_whitelist text[] default null
+  p_max_file_kb int default null, p_whitelist text[] default null, p_max_upload_mb int default null
 ) returns void
 language plpgsql security definer set search_path = public as $$
 declare d text;
@@ -799,7 +805,8 @@ begin
   if nullif(trim(p_club_name), '') is not null then update settings set club_name = trim(p_club_name) where id = 1; end if;
   if (p_domain is not null and p_domain is distinct from (select domain from settings where id = 1))
      or (p_signup_mode is not null and p_signup_mode is distinct from (select signup_mode from settings where id = 1))
-     or (p_max_file_kb is not null and p_max_file_kb is distinct from (select max_file_kb from settings where id = 1)) then
+     or (p_max_file_kb is not null and p_max_file_kb is distinct from (select max_file_kb from settings where id = 1))
+     or (p_max_upload_mb is not null and p_max_upload_mb is distinct from (select max_upload_mb from settings where id = 1)) then
     if not private.is_admin() then raise exception '학교 도메인·가입 방식·파일 용량은 관리자만 바꿀 수 있습니다.'; end if;
   end if;
   perform private.check_len(p_club_name, 40, '동아리 이름');
@@ -816,13 +823,17 @@ begin
     if p_max_file_kb not between 1 and 10240 then raise exception '파일 용량 제한은 1~10240KB(10MB) 사이로 정하세요.'; end if;
     update settings set max_file_kb = p_max_file_kb where id = 1;
   end if;
+  if p_max_upload_mb is not null then
+    if p_max_upload_mb not between 1 and 50 then raise exception '업로드 용량 제한은 1~50MB 사이로 정하세요.'; end if;
+    update settings set max_upload_mb = p_max_upload_mb where id = 1;
+  end if;
   if p_whitelist is not null then
     update private_settings
        set whitelist = coalesce((select array_agg(distinct lower(trim(e))) from unnest(p_whitelist) e where trim(e) <> ''), '{}')
      where id = 1;
   end if;
   perform private.audit('settings.updated', null, jsonb_strip_nulls(jsonb_build_object(
-    'club_name', nullif(trim(p_club_name), ''), 'domain', p_domain, 'signup_mode', p_signup_mode, 'max_file_kb', p_max_file_kb,
+    'club_name', nullif(trim(p_club_name), ''), 'domain', p_domain, 'signup_mode', p_signup_mode, 'max_file_kb', p_max_file_kb, 'max_upload_mb', p_max_upload_mb,
     'whitelist_count', case when p_whitelist is null then null else cardinality(p_whitelist) end)));
 end $$;
 
@@ -1130,9 +1141,12 @@ begin
     end loop;
   elsif p_action in ('hide', 'dismiss') then
     if r.status = 'escalated' and not private.is_admin() then raise exception '관리자에게 넘긴 신고는 관리자가 처리합니다.'; end if;
-    if p_action = 'hide' then update projects set hidden = true where id = r.project_id; end if;
+    if p_action = 'hide' then
+      if r.project_id is not null then update projects set hidden = true where id = r.project_id;
+      else update posts set hidden = true where id = r.post_id; end if;
+    end if;
     update reports set status = 'resolved', action = p_action, resolved_by = u.id, resolved_at = clock_timestamp() where id = p_id;
-    perform private.audit('report.resolved', null, jsonb_build_object('report', p_id, 'project', r.project_id, 'action', p_action));
+    perform private.audit('report.resolved', null, jsonb_build_object('report', p_id, 'project', r.project_id, 'post', r.post_id, 'action', p_action));
   else
     raise exception '잘못된 처리 방식';
   end if;
@@ -1542,7 +1556,9 @@ begin
     'counts', jsonb_build_object('profiles', (select count(*) from profiles), 'projects', (select count(*) from projects),
       'versions', (select count(*) from versions), 'comments', (select count(*) from comments),
       'notifications', (select count(*) from notifications), 'sessions', (select count(*) from sessions),
-      'audit_logs', (select count(*) from audit_logs)),
+      'audit_logs', (select count(*) from audit_logs),
+      'team_projects', (select count(*) from team_projects), 'posts', (select count(*) from posts where deleted_at is null),
+      'team_file_versions', (select count(*) from team_file_versions)),
     'pings', coalesce((select jsonb_agg(jsonb_build_object('at', at, 'ok', ok) order by at desc)
                          from (select at, ok from system_status where kind = 'ping' order by at desc limit 10) x), '[]'::jsonb),
     'backup', case when v_backup then (select jsonb_build_object('at', at, 'ok', ok, 'detail', detail)
@@ -1562,6 +1578,1052 @@ end $$;
 drop trigger if exists on_auth_user_deleted on auth.users;
 create trigger on_auth_user_deleted after delete on auth.users
   for each row execute function private.handle_user_deleted();
+
+-- ---------------------------------------------------------------------
+-- [v2.1] 2단계: 파일 저장소(Storage) · 팀 프로젝트 · 게시판
+-- ---------------------------------------------------------------------
+create table if not exists public.team_projects (
+  id            uuid primary key default gen_random_uuid(),
+  name          text not null,
+  description   text not null default '',
+  goal          text not null default '',
+  leader        uuid not null references public.profiles (id),
+  year          int not null,
+  cover_path    text,
+  status        text not null default 'planning' check (status in ('planning', 'active', 'pending_submit', 'done', 'published', 'archived')),
+  published_at  timestamptz,
+  created_at    timestamptz not null default clock_timestamp(),
+  updated_at    timestamptz not null default clock_timestamp(),
+  deleted_at    timestamptz
+);
+create index if not exists team_projects_year_idx on public.team_projects (year);
+
+create table if not exists public.team_members (
+  team_id     uuid not null references public.team_projects (id),
+  member_id   uuid not null references public.profiles (id),
+  role_label  text not null default '',
+  status      text not null default 'invited' check (status in ('invited', 'active', 'left')),
+  invited_by  uuid,
+  invited_at  timestamptz not null default clock_timestamp(),
+  joined_at   timestamptz,
+  primary key (team_id, member_id)
+);
+create index if not exists team_members_member_idx on public.team_members (member_id);
+
+create table if not exists public.team_files (
+  id          uuid primary key default gen_random_uuid(),
+  team_id     uuid not null references public.team_projects (id),
+  name        text not null,
+  created_by  uuid references public.profiles (id),
+  created_at  timestamptz not null default clock_timestamp()
+);
+create index if not exists team_files_team_idx on public.team_files (team_id);
+
+create table if not exists public.team_file_versions (
+  id           uuid primary key default gen_random_uuid(),
+  file_id      uuid not null references public.team_files (id),
+  version_no   int not null,
+  orig_name    text not null default '',
+  path         text not null unique,
+  size         bigint not null default 0,
+  mime         text,
+  note         text not null default '',
+  uploaded_by  uuid references public.profiles (id),
+  uploaded_at  timestamptz not null default clock_timestamp(),
+  unique (file_id, version_no)
+);
+
+create table if not exists public.team_notes (
+  id          uuid primary key default gen_random_uuid(),
+  team_id     uuid not null references public.team_projects (id),
+  author      uuid not null references public.profiles (id),
+  kind        text not null default 'note' check (kind in ('note', 'progress', 'discussion')),
+  body        text not null,
+  pinned      boolean not null default false,
+  created_at  timestamptz not null default clock_timestamp()
+);
+create index if not exists team_notes_team_idx on public.team_notes (team_id);
+
+create table if not exists public.team_credits (
+  team_id       uuid not null references public.team_projects (id),
+  member_id     uuid not null references public.profiles (id),
+  display_name  text not null,
+  contribution  text not null default '',
+  status        text not null default 'pending' check (status in ('pending', 'confirmed', 'declined')),
+  confirmed_at  timestamptz,
+  updated_by    uuid,
+  primary key (team_id, member_id)
+);
+-- 제작자 표시 변경 이력: 서버 함수만 쓰고, 고치거나 지울 수 없다
+create table if not exists public.team_credit_history (
+  id       bigserial primary key,
+  team_id  uuid not null references public.team_projects (id),
+  actor    uuid,
+  change   jsonb not null default '{}'::jsonb,
+  at       timestamptz not null default clock_timestamp()
+);
+create index if not exists team_credit_history_team_idx on public.team_credit_history (team_id);
+drop trigger if exists team_credit_history_no_change on public.team_credit_history;
+create trigger team_credit_history_no_change before update or delete on public.team_credit_history
+  for each row execute function private.audit_immutable();
+
+create table if not exists public.team_project_sessions (
+  team_id     uuid not null references public.team_projects (id),
+  session_id  uuid not null references public.sessions (id),
+  linked_by   uuid,
+  linked_at   timestamptz not null default clock_timestamp(),
+  primary key (team_id, session_id)
+);
+create index if not exists team_project_sessions_session_idx on public.team_project_sessions (session_id);
+
+create table if not exists public.team_final_files (
+  team_id          uuid not null references public.team_projects (id),
+  file_version_id  uuid not null references public.team_file_versions (id),
+  primary key (team_id, file_version_id)
+);
+
+create table if not exists public.posts (
+  id          uuid primary key default gen_random_uuid(),
+  author      uuid not null references public.profiles (id),
+  board       text not null check (board in ('club', 'free', 'notice')),
+  title       text not null,
+  body        text not null default '',
+  tags        text[] not null default '{}',
+  visibility  text not null default 'members' check (visibility in ('members', 'staff')),
+  cover_path  text,
+  team_id     uuid references public.team_projects (id),
+  project_id  uuid references public.projects (id),
+  year        int not null,
+  pinned      boolean not null default false,
+  hidden      boolean not null default false,
+  created_at  timestamptz not null default clock_timestamp(),
+  updated_at  timestamptz not null default clock_timestamp(),
+  deleted_at  timestamptz
+);
+create index if not exists posts_board_idx on public.posts (board, created_at desc);
+create index if not exists posts_team_idx on public.posts (team_id);
+
+create table if not exists public.post_sessions (
+  post_id     uuid not null references public.posts (id),
+  session_id  uuid not null references public.sessions (id),
+  primary key (post_id, session_id)
+);
+create index if not exists post_sessions_session_idx on public.post_sessions (session_id);
+
+create table if not exists public.post_files (
+  id          uuid primary key default gen_random_uuid(),
+  post_id     uuid not null references public.posts (id),
+  path        text not null unique,
+  name        text not null,
+  size        bigint not null default 0,
+  mime        text,
+  created_at  timestamptz not null default clock_timestamp()
+);
+create index if not exists post_files_post_idx on public.post_files (post_id);
+
+create table if not exists public.post_comments (
+  id          uuid primary key default gen_random_uuid(),
+  post_id     uuid not null references public.posts (id),
+  author      uuid not null references public.profiles (id),
+  body        text not null,
+  created_at  timestamptz not null default clock_timestamp(),
+  deleted_at  timestamptz
+);
+create index if not exists post_comments_post_idx on public.post_comments (post_id);
+
+create table if not exists public.post_reactions (
+  post_id    uuid not null references public.posts (id),
+  member_id  uuid not null references public.profiles (id),
+  kind       text not null default 'like' check (kind in ('like')),
+  primary key (post_id, member_id, kind)
+);
+
+-- 신고: 코드 프로젝트 또는 게시물 중 정확히 하나가 대상
+alter table public.reports add column if not exists post_id uuid references public.posts (id);
+alter table public.reports alter column project_id drop not null;
+alter table public.reports drop constraint if exists reports_one_target;
+alter table public.reports add constraint reports_one_target check ((project_id is not null)::int + (post_id is not null)::int = 1);
+create unique index if not exists report_post_one_open on public.reports (post_id, reporter_id) where status <> 'resolved' and post_id is not null;
+
+-- ---------------------------------------------------------------------
+-- 파일 저장소 도우미 (private)
+-- ---------------------------------------------------------------------
+create or replace function private.uuid_or_null(p text) returns uuid
+language plpgsql immutable as $$
+begin return p::uuid; exception when others then return null; end $$;
+
+-- 실행 파일 등 막는 확장자 (서버 검사. 화면에서도 같은 목록으로 미리 막는다)
+create or replace function private.is_blocked_name(p_name text) returns boolean
+language sql immutable as $$
+  select lower(regexp_replace(trim(coalesce(p_name, '')), '[. ]+$', '')) ~ '\.(exe|bat|cmd|com|msi|scr|ps1|vbs|dll|sh|jar|apk|app|dmg)$'
+$$;
+
+-- Storage 에 올라간 객체의 크기·종류 (storage 스키마가 없는 DB 에서는 빈 결과)
+create or replace function private.storage_object(p_path text) returns table (o_size bigint, o_mime text)
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if to_regclass('storage.objects') is null then return; end if;
+  return query execute 'select coalesce((metadata ->> ''size'')::bigint, 0), metadata ->> ''mimetype'' from storage.objects where bucket_id = ''pop-files'' and name = $1' using p_path;
+end $$;
+
+-- 등록할 파일 검증: 경로 규칙, 막는 확장자, 실제로 올라와 있는지, 크기 제한. 크기·종류를 돌려준다.
+create or replace function private.verify_upload(p_path text, p_prefix text, p_name text) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare v_lim bigint; v_size bigint; v_mime text;
+begin
+  if p_path is null or left(p_path, length(p_prefix)) <> p_prefix or p_path ~ '(\.\.|//|\\)' or length(p_path) > 400 or substr(p_path, length(p_prefix) + 1) = '' then
+    raise exception '올바르지 않은 파일 경로입니다.';
+  end if;
+  if nullif(trim(p_name), '') is null then raise exception '파일 이름이 없습니다.'; end if;
+  perform private.check_len(trim(p_name), 200, '파일 이름');
+  if private.is_blocked_name(p_name) or private.is_blocked_name(p_path) then
+    raise exception '실행 파일 등 올릴 수 없는 형식입니다. (exe, bat, cmd, com, msi, scr, ps1, vbs, dll, sh, jar, apk, app, dmg)';
+  end if;
+  select o_size, o_mime into v_size, v_mime from private.storage_object(p_path);
+  if not found then raise exception '업로드된 파일을 찾을 수 없습니다. 파일을 먼저 올린 뒤 다시 시도하세요.'; end if;
+  select max_upload_mb::bigint * 1048576 into v_lim from settings where id = 1;
+  if v_size <= 0 then raise exception '빈 파일은 올릴 수 없습니다.'; end if;
+  if v_size > v_lim then raise exception '파일이 용량 제한(%MB)을 넘습니다.', v_lim / 1048576; end if;
+  return jsonb_build_object('size', v_size, 'mime', v_mime);
+end $$;
+
+-- ---------------------------------------------------------------------
+-- 팀·게시물 권한 판단 (정책에서 쓰이므로 execute 를 열어 둔다)
+-- ---------------------------------------------------------------------
+create or replace function private.is_team_member(p_team uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from team_members where team_id = p_team and member_id = private.my_member_id() and status = 'active')
+$$;
+create or replace function private.is_team_leader(p_team uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from team_projects where id = p_team and leader = private.my_member_id())
+$$;
+-- 비공개 작업 공간(파일·메모)을 볼 수 있는가: 팀원 또는 운영진. 서버 관리자는 해당 없음.
+create or replace function private.can_view_team(p_team uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select private.is_reader() and (private.is_team_member(p_team) or private.is_staff())
+$$;
+create or replace function private.team_published(p_team uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from team_projects where id = p_team and published_at is not null and deleted_at is null)
+$$;
+create or replace function private.team_of_file(p_file uuid) returns uuid
+language sql stable security definer set search_path = public as $$
+  select team_id from team_files where id = p_file
+$$;
+-- 게시된 팀 프로젝트의 최종본으로 지정된 버전인가 (전체 부원이 볼 수 있는 파일)
+create or replace function private.version_is_public_final(p_version uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select private.is_reader() and exists (
+    select 1 from team_final_files tf join team_projects t on t.id = tf.team_id
+     where tf.file_version_id = p_version and t.published_at is not null and t.deleted_at is null)
+$$;
+create or replace function private.file_has_public_final(p_file uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from team_file_versions v where v.file_id = p_file and private.version_is_public_final(v.id))
+$$;
+-- 게시물을 볼 수 있는가: 운영진은 전부, 그 외에는 지워지지 않았고 (본인 글이거나 [숨김 아님 + 부원 공개])
+create or replace function private.can_read_post(p_id uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select private.is_reader() and exists (
+    select 1 from posts p where p.id = p_id and (
+      private.is_staff()
+      or (p.deleted_at is null and (p.author = private.my_member_id() or (not p.hidden and p.visibility = 'members')))))
+$$;
+
+-- Storage 경로별 열람·업로드 권한 (storage.objects 정책에서 쓴다)
+create or replace function private.can_read_path(p_name text) returns boolean
+language plpgsql stable security definer set search_path = public as $$
+declare k text := split_part(p_name, '/', 1); v_id uuid;
+begin
+  if not private.is_reader() then return false; end if;
+  if k = 'team' then
+    v_id := private.uuid_or_null(split_part(p_name, '/', 2));
+    if v_id is null then return false; end if;
+    return private.can_view_team(v_id)
+        or exists (select 1 from team_file_versions v join team_files f on f.id = v.file_id
+                    where v.path = p_name and f.team_id = v_id and private.version_is_public_final(v.id));
+  elsif k = 'cover' then
+    if split_part(p_name, '/', 2) <> 'team' then return false; end if;
+    v_id := private.uuid_or_null(split_part(p_name, '/', 3));
+    if v_id is null then return false; end if;
+    -- 팀원·운영진은 모두, 그 밖에는 게시된 팀의 대표 이미지(또는 그 게시물의 대표 이미지)로 등록된 파일만
+    return private.can_view_team(v_id)
+        or exists (select 1 from team_projects where id = v_id and cover_path = p_name and published_at is not null and deleted_at is null)
+        or exists (select 1 from posts where cover_path = p_name and private.can_read_post(id));
+  elsif k = 'post' then
+    v_id := private.uuid_or_null(split_part(p_name, '/', 2));
+    if v_id is null or not private.can_read_post(v_id) then return false; end if;
+    -- 작성자는 등록 전 파일도 보고, 다른 사람은 게시물에 첨부·대표 이미지로 등록된 파일만 본다
+    return exists (select 1 from posts where id = v_id and author = private.my_member_id())
+        or exists (select 1 from post_files where path = p_name)
+        or exists (select 1 from posts where id = v_id and cover_path = p_name);
+  end if;
+  return false;
+end $$;
+
+create or replace function private.can_upload_path(p_name text) returns boolean
+language plpgsql stable security definer set search_path = public as $$
+declare k text := split_part(p_name, '/', 1); v_id uuid; t team_projects;
+begin
+  if private.my_status() is distinct from 'active' then return false; end if;
+  if not (p_name ~ '^(team|post)/[0-9a-f-]{36}/[^/]+$' or p_name ~ '^cover/team/[0-9a-f-]{36}/[^/]+$') then return false; end if;
+  if p_name ~ '(\.\.|\\)' or length(p_name) > 400 or private.is_blocked_name(p_name) then return false; end if;
+  if k in ('team', 'cover') then
+    v_id := private.uuid_or_null(split_part(p_name, '/', case when k = 'team' then 2 else 3 end));
+    select * into t from team_projects where id = v_id and deleted_at is null;
+    if t.id is null then return false; end if;
+    if t.year < private.year_of(now()) and not private.is_admin() then return false; end if;
+    if k = 'team' and t.status in ('published', 'archived') then return false; end if;
+    return private.is_team_member(v_id) or private.is_staff();
+  elsif k = 'post' then
+    v_id := private.uuid_or_null(split_part(p_name, '/', 2));
+    return exists (select 1 from posts where id = v_id and author = private.my_member_id() and deleted_at is null);
+  end if;
+  return false;
+end $$;
+
+-- 비공개 버킷과 Storage 정책. storage 스키마가 없는 DB(테스트 등)에서는 건너뛴다.
+-- 수정·삭제 정책은 일부러 만들지 않는다: 올린 파일은 덮어쓸 수 없고, 지우는 일은 관리자가 Supabase 대시보드(Storage)에서만 한다.
+do $$
+begin
+  if to_regclass('storage.buckets') is null or to_regclass('storage.objects') is null then
+    raise notice 'storage 스키마가 없어 파일 저장소(pop-files) 설정을 건너뜁니다.';
+    return;
+  end if;
+  execute 'insert into storage.buckets (id, name, public, file_size_limit) values (''pop-files'', ''pop-files'', false, 52428800)
+           on conflict (id) do update set public = false';
+  execute 'drop policy if exists pop_files_insert on storage.objects';
+  execute 'create policy pop_files_insert on storage.objects for insert to authenticated
+           with check (bucket_id = ''pop-files'' and private.can_upload_path(name))';
+  execute 'drop policy if exists pop_files_select on storage.objects';
+  execute 'create policy pop_files_select on storage.objects for select to authenticated
+           using (bucket_id = ''pop-files'' and private.can_read_path(name))';
+exception when insufficient_privilege then
+  raise notice 'Storage 정책을 만들 권한이 없습니다. SETUP.md 의 Storage 안내를 따라 대시보드에서 직접 만드세요.';
+end $$;
+
+-- ---------------------------------------------------------------------
+-- RPC: 팀 프로젝트 [v2.1]
+-- ---------------------------------------------------------------------
+-- 팀을 쓰기용으로 가져온다: 삭제된 팀 불가, 지난 연도는 관리자만(감사 기록에 남음)
+create or replace function private.team_for_write(p_team uuid, p_action text default null) returns public.team_projects
+language plpgsql security definer set search_path = public as $$
+declare t team_projects;
+begin
+  select * into t from team_projects where id = p_team;
+  if t.id is null or t.deleted_at is not null then raise exception '팀 프로젝트를 찾을 수 없습니다.'; end if;
+  if t.year < private.year_of(now()) then
+    if not private.is_admin() then raise exception '지난 연도의 팀 프로젝트는 읽기 전용입니다. (관리자만 고칠 수 있습니다)'; end if;
+    perform private.audit('team.past_edit', t.leader, jsonb_build_object('team', t.id, 'name', t.name, 'year', t.year, 'action', p_action));
+  end if;
+  return t;
+end $$;
+
+-- 팀원 전체(본인 제외)에게 알림
+create or replace function private.notify_team(p_team uuid, p_text text) returns void
+language plpgsql security definer set search_path = public as $$
+declare r record;
+begin
+  for r in select member_id from team_members where team_id = p_team and status = 'active' loop
+    perform private.notify(r.member_id, p_text, '#/team/' || p_team);
+  end loop;
+end $$;
+
+-- 제출·게시 조건: 최종 파일이 하나 이상 있고 제작자 명단이 모두 확인되어야 한다
+create or replace function private.team_ready(p_team uuid) returns void
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if not exists (select 1 from team_final_files where team_id = p_team) then
+    raise exception '최종본으로 정한 파일이 하나 이상 있어야 합니다. [파일] 탭에서 최종본을 정하세요.';
+  end if;
+  if not exists (select 1 from team_credits where team_id = p_team) then
+    raise exception '제작자 명단을 먼저 작성하세요.';
+  end if;
+  if exists (select 1 from team_credits where team_id = p_team and status <> 'confirmed') then
+    raise exception '제작자 명단을 모든 팀원이 확인해야 합니다.';
+  end if;
+end $$;
+
+create or replace function public.create_team(p_name text, p_description text default '', p_goal text default '') returns uuid
+language plpgsql security definer set search_path = public as $$
+declare u profiles; v_id uuid := gen_random_uuid();
+begin
+  u := private.require_active();
+  if nullif(trim(p_name), '') is null then raise exception '팀 이름을 입력하세요.'; end if;
+  perform private.check_len(trim(p_name), 60, '팀 이름'); perform private.check_len(p_description, 2000, '설명'); perform private.check_len(p_goal, 1000, '목표');
+  insert into team_projects (id, name, description, goal, leader, year)
+  values (v_id, trim(p_name), coalesce(trim(p_description), ''), coalesce(trim(p_goal), ''), u.id, private.year_of(now()));
+  insert into team_members (team_id, member_id, role_label, status, invited_by, joined_at)
+  values (v_id, u.id, '팀장', 'active', u.id, clock_timestamp());
+  return v_id;
+end $$;
+
+-- 팀 정보 수정 (팀장 또는 운영진). p_cover_path: null = 그대로, '' = 지우기
+create or replace function public.update_team(p_id uuid, p_name text default null, p_description text default null, p_goal text default null, p_cover_path text default null) returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; t team_projects; v jsonb;
+begin
+  u := private.require_active();
+  t := private.team_for_write(p_id, 'update');
+  if not (private.is_team_leader(p_id) or private.is_staff()) then raise exception '팀장 또는 운영진만 팀 정보를 고칠 수 있습니다.'; end if;
+  if p_name is not null then
+    if trim(p_name) = '' then raise exception '팀 이름을 입력하세요.'; end if;
+    perform private.check_len(trim(p_name), 60, '팀 이름');
+    update team_projects set name = trim(p_name) where id = p_id;
+  end if;
+  perform private.check_len(p_description, 2000, '설명'); perform private.check_len(p_goal, 1000, '목표');
+  if p_description is not null then update team_projects set description = trim(p_description) where id = p_id; end if;
+  if p_goal is not null then update team_projects set goal = trim(p_goal) where id = p_id; end if;
+  if p_cover_path is not null then
+    if p_cover_path = '' then
+      update team_projects set cover_path = null where id = p_id;
+    else
+      v := private.verify_upload(p_cover_path, 'cover/team/' || p_id || '/', p_cover_path);
+      if lower(p_cover_path) !~ '\.(png|jpe?g|gif|webp)$' then raise exception '대표 이미지는 png, jpg, gif, webp 만 쓸 수 있습니다.'; end if;
+      update team_projects set cover_path = p_cover_path where id = p_id;
+    end if;
+  end if;
+  update team_projects set updated_at = clock_timestamp() where id = p_id;
+end $$;
+
+create or replace function public.invite_team_member(p_team uuid, p_member uuid, p_role_label text default '') returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; t team_projects; m profiles; cur team_members;
+begin
+  u := private.require_active();
+  t := private.team_for_write(p_team, 'invite');
+  if not private.is_team_leader(p_team) then raise exception '팀장만 팀원을 초대할 수 있습니다.'; end if;
+  if t.status in ('published', 'archived') then raise exception '게시 완료·보관된 팀에는 팀원을 초대할 수 없습니다.'; end if;
+  perform private.check_len(p_role_label, 30, '역할');
+  select * into m from profiles where id = p_member;
+  if m.id is null or m.status <> 'active' then raise exception '활동 중인 회원만 초대할 수 있습니다.'; end if;
+  select * into cur from team_members where team_id = p_team and member_id = p_member;
+  if cur.team_id is not null and cur.status = 'active' then raise exception '이미 팀원입니다.'; end if;
+  if cur.team_id is not null and cur.status = 'invited' then raise exception '이미 초대했습니다. 상대방의 응답을 기다리세요.'; end if;
+  if cur.team_id is null then
+    insert into team_members (team_id, member_id, role_label, status, invited_by) values (p_team, p_member, coalesce(trim(p_role_label), ''), 'invited', u.id);
+  else
+    update team_members set status = 'invited', role_label = coalesce(trim(p_role_label), ''), invited_by = u.id, invited_at = clock_timestamp(), joined_at = null
+     where team_id = p_team and member_id = p_member;
+  end if;
+  perform private.notify(p_member, format('%s 님이 팀 프로젝트 「%s」에 초대했습니다.', u.name, t.name), '#/team/' || p_team);
+end $$;
+
+create or replace function public.respond_team_invite(p_team uuid, p_accept boolean) returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; t team_projects; cur team_members;
+begin
+  u := private.require_active();
+  select * into t from team_projects where id = p_team and deleted_at is null;
+  if t.id is null then raise exception '팀 프로젝트를 찾을 수 없습니다.'; end if;
+  select * into cur from team_members where team_id = p_team and member_id = u.id for update;
+  if cur.team_id is null or cur.status <> 'invited' then raise exception '받은 초대가 없습니다.'; end if;
+  if p_accept is null then raise exception '수락 또는 거절을 선택하세요.'; end if;
+  if p_accept then
+    update team_members set status = 'active', joined_at = clock_timestamp() where team_id = p_team and member_id = u.id;
+    perform private.notify(t.leader, format('%s 님이 팀 「%s」 초대를 수락했습니다.', u.name, t.name), '#/team/' || p_team);
+  else
+    update team_members set status = 'left' where team_id = p_team and member_id = u.id;
+    perform private.notify(t.leader, format('%s 님이 팀 「%s」 초대를 거절했습니다.', u.name, t.name), '#/team/' || p_team);
+  end if;
+end $$;
+
+create or replace function private.drop_member_credit(p_team uuid, p_member uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare c team_credits;
+begin
+  select * into c from team_credits where team_id = p_team and member_id = p_member;
+  if c.team_id is null then return; end if;
+  delete from team_credits where team_id = p_team and member_id = p_member;
+  insert into team_credit_history (team_id, actor, change)
+  values (p_team, private.my_member_id(), jsonb_build_object('kind', 'removed', 'member', p_member, 'display_name', c.display_name, 'reason', 'left'));
+end $$;
+
+create or replace function public.remove_team_member(p_team uuid, p_member uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; t team_projects; cur team_members;
+begin
+  u := private.require_active();
+  t := private.team_for_write(p_team, 'remove_member');
+  if not private.is_team_leader(p_team) then raise exception '팀장만 팀원을 내보낼 수 있습니다.'; end if;
+  if t.status in ('published', 'archived') then raise exception '게시 완료·보관된 팀의 팀원은 바꿀 수 없습니다.'; end if;
+  if p_member = t.leader then raise exception '팀장은 내보낼 수 없습니다. 먼저 팀장을 넘기세요.'; end if;
+  select * into cur from team_members where team_id = p_team and member_id = p_member;
+  if cur.team_id is null or cur.status = 'left' then raise exception '팀원이 아닙니다.'; end if;
+  update team_members set status = 'left' where team_id = p_team and member_id = p_member;
+  perform private.drop_member_credit(p_team, p_member);
+  perform private.notify(p_member, format('팀 「%s」에서 제외되었습니다.', t.name), '#/team/' || p_team);
+end $$;
+
+create or replace function public.leave_team(p_team uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; t team_projects;
+begin
+  u := private.require_active();
+  t := private.team_for_write(p_team, 'leave');
+  if t.leader = u.id then raise exception '팀장은 팀을 떠날 수 없습니다. 먼저 팀장을 다른 팀원에게 넘기세요.'; end if;
+  if not private.is_team_member(p_team) then raise exception '팀원이 아닙니다.'; end if;
+  update team_members set status = 'left' where team_id = p_team and member_id = u.id;
+  if t.published_at is null then perform private.drop_member_credit(p_team, u.id); end if;
+  perform private.notify(t.leader, format('%s 님이 팀 「%s」를 떠났습니다.', u.name, t.name), '#/team/' || p_team);
+end $$;
+
+create or replace function public.transfer_team_leader(p_team uuid, p_member uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; t team_projects; m profiles;
+begin
+  u := private.require_active();
+  t := private.team_for_write(p_team, 'leader');
+  if not (private.is_team_leader(p_team) or private.is_staff()) then raise exception '팀장 또는 운영진만 팀장을 바꿀 수 있습니다.'; end if;
+  if p_member = t.leader then raise exception '이미 팀장입니다.'; end if;
+  select * into m from profiles where id = p_member;
+  if m.id is null or m.status <> 'active' or not exists (select 1 from team_members where team_id = p_team and member_id = p_member and status = 'active') then
+    raise exception '활동 중인 팀원에게만 팀장을 넘길 수 있습니다.';
+  end if;
+  update team_projects set leader = p_member, updated_at = clock_timestamp() where id = p_team;
+  update team_members set role_label = '팀장' where team_id = p_team and member_id = p_member;
+  update team_members set role_label = '' where team_id = p_team and member_id = t.leader and role_label = '팀장';
+  if t.leader <> u.id then
+    perform private.audit('team.leader_changed', p_member, jsonb_build_object('team', p_team, 'name', t.name, 'from', t.leader));
+  end if;
+  perform private.notify(p_member, format('팀 「%s」의 팀장이 되었습니다.', t.name), '#/team/' || p_team);
+  perform private.notify(t.leader, format('팀 「%s」의 팀장이 %s 님으로 바뀌었습니다.', t.name, m.name), '#/team/' || p_team);
+end $$;
+
+-- 상태 변경. 게시(published)는 publish_team 으로만 한다.
+create or replace function public.set_team_status(p_team uuid, p_status text) returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; t team_projects; v_leader boolean; v_staff boolean;
+begin
+  u := private.require_active();
+  t := private.team_for_write(p_team, 'status');
+  v_leader := private.is_team_leader(p_team); v_staff := private.is_staff();
+  if p_status is null or p_status not in ('planning', 'active', 'pending_submit', 'done', 'archived') then raise exception '바꿀 수 없는 상태입니다.'; end if;
+  if p_status = t.status then raise exception '이미 그 상태입니다.'; end if;
+  if p_status = 'archived' then
+    if not (v_leader or v_staff) then raise exception '팀장 또는 운영진만 보관할 수 있습니다.'; end if;
+  elsif t.status = 'archived' or t.status = 'published' then
+    raise exception '게시 완료·보관된 팀의 상태는 바꿀 수 없습니다.';
+  elsif t.status = 'planning' and p_status = 'active' then
+    if not v_leader then raise exception '팀장만 진행을 시작할 수 있습니다.'; end if;
+  elsif t.status = 'active' and p_status = 'pending_submit' then
+    if not v_leader then raise exception '팀장만 최종 제출할 수 있습니다.'; end if;
+    perform private.team_ready(p_team);
+  elsif t.status = 'pending_submit' and p_status = 'active' then
+    if not (v_leader or v_staff) then raise exception '팀장 또는 운영진만 제출을 되돌릴 수 있습니다.'; end if;
+  elsif t.status = 'pending_submit' and p_status = 'done' then
+    if not v_staff then raise exception '운영진만 완료 처리할 수 있습니다.'; end if;
+  elsif t.status = 'done' and p_status = 'active' then
+    if not v_staff then raise exception '운영진만 완료를 되돌릴 수 있습니다.'; end if;
+  else
+    raise exception '바꿀 수 없는 상태 변경입니다.';
+  end if;
+  update team_projects set status = p_status, updated_at = clock_timestamp() where id = p_team;
+  if v_staff and not v_leader then
+    perform private.audit('team.status', t.leader, jsonb_build_object('team', p_team, 'name', t.name, 'from', t.status, 'to', p_status));
+  end if;
+  if p_status = 'pending_submit' then
+    perform private.notify_staff(format('팀 「%s」이(가) 최종 제출되었습니다. 확인해 주세요.', t.name), '#/team/' || p_team);
+  elsif p_status = 'done' then
+    perform private.notify_team(p_team, format('팀 「%s」이(가) 완료 처리되었습니다. 곧 게시판에 게시됩니다.', t.name));
+  elsif p_status = 'active' and t.status in ('pending_submit', 'done') then
+    perform private.notify(t.leader, format('팀 「%s」의 제출이 되돌려졌습니다.', t.name), '#/team/' || p_team);
+  end if;
+end $$;
+
+-- 파일 등록: 파일은 이미 Storage 에 올라가 있어야 한다. 같은 파일(이름)이면 새 버전으로 쌓이고, 덮어쓰지 않는다.
+create or replace function public.register_team_file(p_team uuid, p_path text, p_name text, p_note text default '', p_file_id uuid default null) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare u profiles; t team_projects; v jsonb; v_file uuid; v_no int; v_ver uuid; v_name text := trim(coalesce(p_name, ''));
+begin
+  u := private.require_active();
+  t := private.team_for_write(p_team, 'file');
+  if not private.is_team_member(p_team) then raise exception '팀원만 파일을 올릴 수 있습니다.'; end if;
+  if t.status in ('published', 'archived') then raise exception '게시 완료·보관된 팀에는 파일을 올릴 수 없습니다.'; end if;
+  perform private.check_len(p_note, 500, '버전 메모');
+  v := private.verify_upload(p_path, 'team/' || p_team || '/', v_name);
+  if exists (select 1 from team_file_versions where path = p_path) then raise exception '이미 등록된 파일입니다.'; end if;
+  if p_file_id is not null then
+    select id into v_file from team_files where id = p_file_id and team_id = p_team for update;
+    if v_file is null then raise exception '새 버전을 올릴 파일을 찾을 수 없습니다.'; end if;
+  else
+    select id into v_file from team_files where team_id = p_team and lower(name) = lower(v_name) order by created_at limit 1 for update;
+    if v_file is null then
+      insert into team_files (team_id, name, created_by) values (p_team, v_name, u.id) returning id into v_file;
+    end if;
+  end if;
+  select coalesce(max(version_no), 0) + 1 into v_no from team_file_versions where file_id = v_file;
+  insert into team_file_versions (file_id, version_no, orig_name, path, size, mime, note, uploaded_by)
+  values (v_file, v_no, v_name, p_path, (v ->> 'size')::bigint, v ->> 'mime', coalesce(trim(p_note), ''), u.id) returning id into v_ver;
+  update team_projects set updated_at = clock_timestamp() where id = p_team;
+  perform private.notify_team(p_team, format('%s 님이 「%s」의 파일 「%s」 v%s을(를) 올렸습니다.', u.name, t.name, (select name from team_files where id = v_file), v_no));
+  return v_ver;
+end $$;
+
+-- 최종본 지정/해제 (팀장). 같은 파일의 다른 버전이 최종본이면 바꿔 끼운다.
+create or replace function public.set_team_final(p_team uuid, p_version uuid, p_final boolean) returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; t team_projects; v_file uuid;
+begin
+  u := private.require_active();
+  t := private.team_for_write(p_team, 'final');
+  if not private.is_team_leader(p_team) then raise exception '팀장만 최종본을 정할 수 있습니다.'; end if;
+  if t.status in ('pending_submit', 'done', 'published', 'archived') then raise exception '제출 대기 이후에는 최종본을 바꿀 수 없습니다. 먼저 제출을 되돌리세요.'; end if;
+  select v.file_id into v_file from team_file_versions v join team_files f on f.id = v.file_id where v.id = p_version and f.team_id = p_team;
+  if v_file is null then raise exception '이 팀의 파일 버전이 아닙니다.'; end if;
+  if p_final then
+    delete from team_final_files where team_id = p_team and file_version_id in (select id from team_file_versions where file_id = v_file);
+    insert into team_final_files (team_id, file_version_id) values (p_team, p_version);
+  else
+    delete from team_final_files where team_id = p_team and file_version_id = p_version;
+  end if;
+end $$;
+
+create or replace function public.add_team_note(p_team uuid, p_kind text, p_body text) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare u profiles; t team_projects; v_id uuid;
+begin
+  u := private.require_active();
+  t := private.team_for_write(p_team, 'note');
+  if not private.is_team_member(p_team) then raise exception '팀원만 쓸 수 있습니다.'; end if;
+  if t.status in ('published', 'archived') then raise exception '게시 완료·보관된 팀에는 쓸 수 없습니다.'; end if;
+  if p_kind is null or p_kind not in ('note', 'progress', 'discussion') then raise exception '글 종류가 올바르지 않습니다.'; end if;
+  if nullif(trim(p_body), '') is null then raise exception '내용을 입력하세요.'; end if;
+  perform private.check_len(trim(p_body), 4000, '내용');
+  insert into team_notes (team_id, author, kind, body) values (p_team, u.id, p_kind, trim(p_body)) returning id into v_id;
+  update team_projects set updated_at = clock_timestamp() where id = p_team;
+  return v_id;
+end $$;
+
+create or replace function public.delete_team_note(p_id uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; n team_notes;
+begin
+  u := private.require_active();
+  select * into n from team_notes where id = p_id;
+  if n.id is null then raise exception '글이 없습니다.'; end if;
+  perform private.team_for_write(n.team_id, 'note_delete');
+  if n.author <> u.id and not private.is_team_leader(n.team_id) then raise exception '본인 글 또는 팀장만 지울 수 있습니다.'; end if;
+  delete from team_notes where id = p_id;
+end $$;
+
+create or replace function public.pin_team_note(p_id uuid, p_pinned boolean) returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; n team_notes;
+begin
+  u := private.require_active();
+  select * into n from team_notes where id = p_id;
+  if n.id is null then raise exception '글이 없습니다.'; end if;
+  perform private.team_for_write(n.team_id, 'note_pin');
+  if not private.is_team_leader(n.team_id) then raise exception '팀장만 고정할 수 있습니다.'; end if;
+  update team_notes set pinned = coalesce(p_pinned, false) where id = p_id;
+end $$;
+
+-- 제작자 명단 (팀장이 작성 → 각자 확인/거절). 게시 후에는 관리자만 고칠 수 있고 이력·감사 기록이 남는다.
+-- p_credits: [{"member_id": "...", "display_name": "...", "contribution": "..."}]
+create or replace function public.set_team_credits(p_team uuid, p_credits jsonb) returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  u profiles; t team_projects; e jsonb; v_post boolean; v_m uuid; v_name text; v_con text;
+  old team_credits; seen uuid[] := '{}'; r record; v_status text; n_changes int := 0;
+begin
+  u := private.require_active();
+  t := private.team_for_write(p_team, 'credits');
+  v_post := t.published_at is not null;
+  if v_post then
+    if not private.is_admin() then raise exception '게시된 뒤에는 관리자만 제작자 표시를 고칠 수 있습니다.'; end if;
+  else
+    if not private.is_team_leader(p_team) then raise exception '팀장만 제작자 명단을 작성할 수 있습니다.'; end if;
+    if t.status not in ('planning', 'active') then raise exception '제출 대기·완료 상태에서는 제작자 명단을 고칠 수 없습니다. 먼저 제출을 되돌리세요.'; end if;
+  end if;
+  if p_credits is null or jsonb_typeof(p_credits) <> 'array' then raise exception '제작자 명단 형식이 올바르지 않습니다.'; end if;
+  if jsonb_array_length(p_credits) > 30 then raise exception '제작자는 30명까지 올릴 수 있습니다.'; end if;
+  v_status := case when v_post then 'confirmed' else 'pending' end;
+  for e in select * from jsonb_array_elements(p_credits) loop
+    v_m := private.uuid_or_null(e ->> 'member_id');
+    v_name := nullif(trim(coalesce(e ->> 'display_name', '')), '');
+    v_con := trim(coalesce(e ->> 'contribution', ''));
+    if v_m is null then raise exception '제작자 회원이 올바르지 않습니다.'; end if;
+    if v_m = any (seen) then raise exception '같은 회원이 두 번 들어 있습니다.'; end if;
+    if not exists (select 1 from team_members where team_id = p_team and member_id = v_m and (status = 'active' or (v_post and status = 'left'))) then
+      raise exception '팀원이 아닌 회원은 제작자로 올릴 수 없습니다.';
+    end if;
+    if v_name is null then raise exception '이름 표기를 입력하세요.'; end if;
+    perform private.check_len(v_name, 50, '이름 표기'); perform private.check_len(v_con, 200, '역할·기여');
+    seen := seen || v_m;
+  end loop;
+  if cardinality(seen) = 0 then raise exception '제작자를 한 명 이상 올리세요.'; end if;
+  for r in select * from team_credits where team_id = p_team and not (member_id = any (seen)) loop
+    delete from team_credits where team_id = p_team and member_id = r.member_id;
+    insert into team_credit_history (team_id, actor, change)
+    values (p_team, u.id, jsonb_build_object('kind', 'removed', 'member', r.member_id, 'display_name', r.display_name));
+    n_changes := n_changes + 1;
+  end loop;
+  for e in select * from jsonb_array_elements(p_credits) loop
+    v_m := (e ->> 'member_id')::uuid;
+    v_name := trim(e ->> 'display_name'); v_con := trim(coalesce(e ->> 'contribution', ''));
+    select * into old from team_credits where team_id = p_team and member_id = v_m;
+    if old.team_id is null then
+      insert into team_credits (team_id, member_id, display_name, contribution, status, confirmed_at, updated_by)
+      values (p_team, v_m, v_name, v_con, v_status, case when v_post then clock_timestamp() end, u.id);
+      insert into team_credit_history (team_id, actor, change)
+      values (p_team, u.id, jsonb_build_object('kind', 'added', 'member', v_m, 'display_name', v_name, 'contribution', v_con));
+      n_changes := n_changes + 1;
+      if not v_post then perform private.notify(v_m, format('팀 「%s」의 제작자 표시 확인을 요청받았습니다.', t.name), '#/team/' || p_team || '?tab=credits'); end if;
+    elsif old.display_name <> v_name or old.contribution <> v_con then
+      update team_credits set display_name = v_name, contribution = v_con, status = v_status,
+             confirmed_at = case when v_post then clock_timestamp() end, updated_by = u.id
+       where team_id = p_team and member_id = v_m;
+      insert into team_credit_history (team_id, actor, change)
+      values (p_team, u.id, jsonb_build_object('kind', 'changed', 'member', v_m, 'display_name', v_name, 'contribution', v_con,
+                'from_display_name', old.display_name, 'from_contribution', old.contribution));
+      n_changes := n_changes + 1;
+      if not v_post then perform private.notify(v_m, format('팀 「%s」의 제작자 표시가 바뀌어 다시 확인이 필요합니다.', t.name), '#/team/' || p_team || '?tab=credits'); end if;
+    end if;
+  end loop;
+  if v_post and n_changes > 0 then
+    perform private.audit('team.credits_edited', t.leader, jsonb_build_object('team', p_team, 'name', t.name, 'count', n_changes));
+  end if;
+end $$;
+
+-- 본인 항목만 확인/거절한다 (대상 회원을 인자로 받지 않는다)
+create or replace function public.respond_team_credit(p_team uuid, p_confirm boolean) returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; t team_projects; c team_credits;
+begin
+  u := private.require_active();
+  t := private.team_for_write(p_team, 'credit_respond');
+  select * into c from team_credits where team_id = p_team and member_id = u.id for update;
+  if c.team_id is null then raise exception '내 이름으로 올라온 제작자 표시가 없습니다.'; end if;
+  if c.status <> 'pending' then raise exception '확인 대기 중인 항목이 아닙니다.'; end if;
+  if p_confirm is null then raise exception '확인 또는 거절을 선택하세요.'; end if;
+  update team_credits set status = case when p_confirm then 'confirmed' else 'declined' end,
+         confirmed_at = case when p_confirm then clock_timestamp() end, updated_by = u.id
+   where team_id = p_team and member_id = u.id;
+  insert into team_credit_history (team_id, actor, change)
+  values (p_team, u.id, jsonb_build_object('kind', case when p_confirm then 'confirmed' else 'declined' end, 'member', u.id, 'display_name', c.display_name));
+  perform private.notify(t.leader, format('%s 님이 제작자 표시를 %s했습니다. (팀 「%s」)', u.name, case when p_confirm then '확인' else '거절' end, t.name), '#/team/' || p_team || '?tab=credits');
+  if p_confirm and not exists (select 1 from team_credits where team_id = p_team and status <> 'confirmed') then
+    perform private.notify(t.leader, format('팀 「%s」의 제작자 명단을 모두 확인했습니다. 이제 제출할 수 있습니다.', t.name), '#/team/' || p_team || '?tab=credits');
+  end if;
+end $$;
+
+create or replace function private.check_team_session(p_team uuid, p_session uuid) returns boolean
+language plpgsql security definer set search_path = public as $$
+declare t team_projects; s sessions; v_past boolean;
+begin
+  perform private.require_active();
+  t := private.team_for_write(p_team, 'session');
+  select * into s from sessions where id = p_session;
+  if s.id is null then raise exception '차시가 없습니다.'; end if;
+  if not (private.is_team_leader(p_team) or private.is_staff()) then raise exception '팀장 또는 운영진만 차시에 연결할 수 있습니다.'; end if;
+  v_past := s.year <> private.year_of(now());
+  if v_past and not private.is_admin() then raise exception '지난 연도의 차시는 관리자만 연결할 수 있습니다.'; end if;
+  return v_past;
+end $$;
+
+create or replace function public.link_team_session(p_team uuid, p_session uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare v_past boolean;
+begin
+  v_past := private.check_team_session(p_team, p_session);
+  insert into team_project_sessions (team_id, session_id, linked_by) values (p_team, p_session, private.my_member_id()) on conflict do nothing;
+  if v_past then perform private.audit('team.session_link_past', (select leader from team_projects where id = p_team), jsonb_build_object('team', p_team, 'session', p_session)); end if;
+end $$;
+
+create or replace function public.unlink_team_session(p_team uuid, p_session uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare v_past boolean;
+begin
+  v_past := private.check_team_session(p_team, p_session);
+  delete from team_project_sessions where team_id = p_team and session_id = p_session;
+  if v_past then perform private.audit('team.session_unlink_past', (select leader from team_projects where id = p_team), jsonb_build_object('team', p_team, 'session', p_session)); end if;
+end $$;
+
+-- 게시: 운영진이 완료된 팀 프로젝트를 동아리 게시판에 올린다 (제작자 명단·차시·대표 이미지가 자동 연결)
+create or replace function public.publish_team(p_team uuid) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare u profiles; t team_projects; v_post uuid := gen_random_uuid(); v_body text;
+begin
+  u := private.require_staff();
+  t := private.team_for_write(p_team, 'publish');
+  if t.status <> 'done' then raise exception '완료 처리된 팀 프로젝트만 게시할 수 있습니다.'; end if;
+  perform private.team_ready(p_team);
+  v_body := coalesce(nullif(t.description, ''), '') || case when t.goal <> '' then E'\n\n## 목표\n' || t.goal else '' end;
+  insert into posts (id, author, board, title, body, tags, visibility, cover_path, team_id, year)
+  values (v_post, t.leader, 'club', t.name, v_body, array['팀프로젝트'], 'members', t.cover_path, p_team, t.year);
+  insert into post_sessions (post_id, session_id) select v_post, session_id from team_project_sessions where team_id = p_team;
+  update team_projects set status = 'published', published_at = clock_timestamp(), updated_at = clock_timestamp() where id = p_team;
+  perform private.audit('team.published', t.leader, jsonb_build_object('team', p_team, 'name', t.name, 'post', v_post));
+  perform private.notify_team(p_team, format('팀 「%s」이(가) 동아리 게시판에 게시되었습니다.', t.name));
+  perform private.notify(t.leader, format('팀 「%s」이(가) 동아리 게시판에 게시되었습니다.', t.name), '#/post/' || v_post);
+  return v_post;
+end $$;
+
+-- ---------------------------------------------------------------------
+-- RPC: 게시판·공지 [v2.1]
+-- ---------------------------------------------------------------------
+create or replace function private.clean_tags(p text[]) returns text[]
+language sql immutable as $$
+  select coalesce(array(select x from (select distinct left(trim(both '#' from trim(t)), 20) x from unnest(coalesce(p, '{}')) t) s where x <> '' order by x limit 8), '{}')
+$$;
+
+-- 게시물의 차시 연결을 p_sessions 로 맞춘다 (지난 연도 차시는 관리자만)
+create or replace function private.set_post_sessions(p_post uuid, p_sessions uuid[]) returns void
+language plpgsql security definer set search_path = public as $$
+declare s sessions; x uuid;
+begin
+  if cardinality(coalesce(p_sessions, '{}')) > 10 then raise exception '차시는 10개까지 연결할 수 있습니다.'; end if;
+  foreach x in array coalesce(p_sessions, '{}') loop
+    select * into s from sessions where id = x;
+    if s.id is null then raise exception '차시가 없습니다.'; end if;
+    if s.year <> private.year_of(now()) and not private.is_admin()
+       and not exists (select 1 from post_sessions where post_id = p_post and session_id = x) then
+      raise exception '지난 연도의 차시는 관리자만 연결할 수 있습니다.';
+    end if;
+  end loop;
+  delete from post_sessions where post_id = p_post and not (session_id = any (coalesce(p_sessions, '{}')));
+  insert into post_sessions (post_id, session_id) select p_post, y from (select distinct unnest(coalesce(p_sessions, '{}')) y) z
+  on conflict do nothing;
+end $$;
+
+create or replace function public.create_post(
+  p_board text, p_title text, p_body text, p_tags text[] default '{}', p_visibility text default 'members',
+  p_team_id uuid default null, p_project_id uuid default null, p_session_ids uuid[] default '{}', p_pinned boolean default false
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare u profiles; v_id uuid := gen_random_uuid(); r record;
+begin
+  u := private.require_active();
+  if p_board is null or p_board not in ('club', 'free', 'notice') then raise exception '게시판을 선택하세요.'; end if;
+  if p_board in ('club', 'notice') and not private.is_staff() then
+    raise exception '동아리·공지 게시물은 운영진만 쓸 수 있습니다. 개인 창작물은 자유 게시판에 올려 주세요.';
+  end if;
+  if nullif(trim(p_title), '') is null then raise exception '제목을 입력하세요.'; end if;
+  perform private.check_len(trim(p_title), 100, '제목'); perform private.check_len(p_body, 20000, '내용');
+  if p_visibility is null or p_visibility not in ('members', 'staff') then raise exception '공개 범위가 올바르지 않습니다.'; end if;
+  if coalesce(p_pinned, false) and p_board <> 'notice' then raise exception '고정은 공지에만 쓸 수 있습니다.'; end if;
+  if p_team_id is not null then
+    if p_board <> 'club' then raise exception '팀 프로젝트는 동아리 게시물에만 연결할 수 있습니다.'; end if;
+    if not private.team_published(p_team_id) then raise exception '게시 완료된 팀 프로젝트만 연결할 수 있습니다.'; end if;
+  end if;
+  if p_project_id is not null then perform private.get_project(p_project_id); end if;
+  insert into posts (id, author, board, title, body, tags, visibility, team_id, project_id, year, pinned)
+  values (v_id, u.id, p_board, trim(p_title), coalesce(p_body, ''), private.clean_tags(p_tags), p_visibility, p_team_id, p_project_id,
+          private.year_of(now()), coalesce(p_pinned, false));
+  perform private.set_post_sessions(v_id, p_session_ids);
+  if p_board = 'notice' then
+    for r in select id from profiles where status = 'active' and (p_visibility = 'members' or id in (select member_id from user_roles where role in ('owner', 'admin', 'president', 'vice'))) loop
+      perform private.notify(r.id, format('새 공지: %s', trim(p_title)), '#/post/' || v_id);
+    end loop;
+  end if;
+  return v_id;
+end $$;
+
+create or replace function public.update_post(
+  p_id uuid, p_title text, p_body text, p_tags text[] default '{}', p_visibility text default 'members',
+  p_project_id uuid default null, p_session_ids uuid[] default '{}'
+) returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; p posts;
+begin
+  u := private.require_active();
+  select * into p from posts where id = p_id;
+  if p.id is null or p.deleted_at is not null then raise exception '게시물을 찾을 수 없습니다.'; end if;
+  if p.author <> u.id then raise exception '작성자만 고칠 수 있습니다.'; end if;
+  if p.board in ('club', 'notice') and not private.is_staff() then raise exception '동아리·공지 게시물은 운영진만 고칠 수 있습니다.'; end if;
+  if nullif(trim(p_title), '') is null then raise exception '제목을 입력하세요.'; end if;
+  perform private.check_len(trim(p_title), 100, '제목'); perform private.check_len(p_body, 20000, '내용');
+  if p_visibility is null or p_visibility not in ('members', 'staff') then raise exception '공개 범위가 올바르지 않습니다.'; end if;
+  if p_project_id is not null then perform private.get_project(p_project_id); end if;
+  update posts set title = trim(p_title), body = coalesce(p_body, ''), tags = private.clean_tags(p_tags), visibility = p_visibility,
+         project_id = p_project_id, updated_at = clock_timestamp() where id = p_id;
+  perform private.set_post_sessions(p_id, p_session_ids);
+end $$;
+
+-- 소프트 삭제: 본인 또는 운영진 (운영진이 남의 글을 지우면 감사 기록)
+create or replace function public.delete_post(p_id uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; p posts;
+begin
+  u := private.require_active();
+  select * into p from posts where id = p_id;
+  if p.id is null or p.deleted_at is not null then raise exception '게시물을 찾을 수 없습니다.'; end if;
+  if p.board in ('club', 'notice') then
+    if not private.is_staff() then raise exception '동아리·공지 게시물은 운영진만 지울 수 있습니다.'; end if;
+  elsif p.author <> u.id and not private.is_staff() then raise exception '작성자 또는 운영진만 지울 수 있습니다.'; end if;
+  update posts set deleted_at = clock_timestamp() where id = p_id;
+  if p.author <> u.id then
+    perform private.audit('post.deleted', p.author, jsonb_build_object('post', p_id, 'title', p.title));
+  end if;
+end $$;
+
+create or replace function public.set_post_hidden(p_id uuid, p_hidden boolean) returns void
+language plpgsql security definer set search_path = public as $$
+declare p posts;
+begin
+  perform private.require_staff();
+  select * into p from posts where id = p_id;
+  if p.id is null or p.deleted_at is not null then raise exception '게시물을 찾을 수 없습니다.'; end if;
+  update posts set hidden = coalesce(p_hidden, false) where id = p_id;
+  perform private.audit(case when coalesce(p_hidden, false) then 'post.hidden' else 'post.unhidden' end, p.author, jsonb_build_object('post', p_id, 'title', p.title));
+end $$;
+
+create or replace function public.set_post_pinned(p_id uuid, p_pinned boolean) returns void
+language plpgsql security definer set search_path = public as $$
+declare p posts;
+begin
+  perform private.require_staff();
+  select * into p from posts where id = p_id;
+  if p.id is null or p.deleted_at is not null then raise exception '게시물을 찾을 수 없습니다.'; end if;
+  if p.board <> 'notice' then raise exception '공지만 고정할 수 있습니다.'; end if;
+  update posts set pinned = coalesce(p_pinned, false) where id = p_id;
+end $$;
+
+-- 첨부·대표 이미지 등록 (작성자). 파일은 post/<게시물 ID>/ 아래에 이미 올라가 있어야 한다.
+create or replace function public.register_post_file(p_post uuid, p_path text, p_name text, p_cover boolean default false) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare u profiles; p posts; v jsonb; v_id uuid;
+begin
+  u := private.require_active();
+  select * into p from posts where id = p_post;
+  if p.id is null or p.deleted_at is not null then raise exception '게시물을 찾을 수 없습니다.'; end if;
+  if p.author <> u.id then raise exception '작성자만 파일을 붙일 수 있습니다.'; end if;
+  if p.board in ('club', 'notice') and not private.is_staff() then raise exception '동아리·공지 게시물은 운영진만 고칠 수 있습니다.'; end if;
+  v := private.verify_upload(p_path, 'post/' || p_post || '/', p_name);
+  if exists (select 1 from post_files where path = p_path) then raise exception '이미 등록된 파일입니다.'; end if;
+  if coalesce(p_cover, false) then
+    if lower(p_path) !~ '\.(png|jpe?g|gif|webp)$' then raise exception '대표 이미지는 png, jpg, gif, webp 만 쓸 수 있습니다.'; end if;
+    update posts set cover_path = p_path, updated_at = clock_timestamp() where id = p_post;
+    return null;
+  end if;
+  if (select count(*) from post_files where post_id = p_post) >= 10 then raise exception '첨부는 10개까지 붙일 수 있습니다.'; end if;
+  insert into post_files (post_id, path, name, size, mime) values (p_post, p_path, trim(p_name), (v ->> 'size')::bigint, v ->> 'mime') returning id into v_id;
+  return v_id;
+end $$;
+
+create or replace function public.remove_post_file(p_id uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; f post_files;
+begin
+  u := private.require_active();
+  select * into f from post_files where id = p_id;
+  if f.id is null then raise exception '첨부가 없습니다.'; end if;
+  if not exists (select 1 from posts where id = f.post_id and author = u.id) then raise exception '작성자만 지울 수 있습니다.'; end if;
+  if exists (select 1 from posts where id = f.post_id and board in ('club', 'notice')) and not private.is_staff() then raise exception '동아리·공지 게시물은 운영진만 고칠 수 있습니다.'; end if;
+  delete from post_files where id = p_id;   -- 저장소의 실제 파일은 남는다 (관리자가 대시보드에서 정리)
+end $$;
+
+create or replace function public.add_post_comment(p_post uuid, p_body text) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare u profiles; p posts; v_id uuid;
+begin
+  u := private.require_active();
+  if not private.can_read_post(p_post) then raise exception '게시물을 찾을 수 없습니다.'; end if;
+  select * into p from posts where id = p_post;
+  if p.deleted_at is not null then raise exception '삭제된 게시물입니다.'; end if;
+  if nullif(trim(p_body), '') is null then raise exception '댓글 내용을 입력하세요.'; end if;
+  perform private.check_len(trim(p_body), 2000, '댓글');
+  insert into post_comments (post_id, author, body) values (p_post, u.id, trim(p_body)) returning id into v_id;
+  perform private.notify(p.author, format('%s 님이 「%s」에 댓글을 남겼습니다.', u.name, p.title), '#/post/' || p_post);
+  return v_id;
+end $$;
+
+create or replace function public.delete_post_comment(p_id uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; c post_comments;
+begin
+  u := private.require_active();
+  select * into c from post_comments where id = p_id;
+  if c.id is null or c.deleted_at is not null then raise exception '댓글이 없습니다.'; end if;
+  if c.author <> u.id and not private.is_staff() then raise exception '본인 댓글만 지울 수 있습니다.'; end if;
+  update post_comments set deleted_at = clock_timestamp() where id = p_id;
+  if c.author <> u.id then perform private.audit('post.comment_deleted', c.author, jsonb_build_object('post', c.post_id)); end if;
+end $$;
+
+-- 좋아요 토글. 지금 눌린 상태를 돌려준다.
+create or replace function public.toggle_post_reaction(p_post uuid) returns boolean
+language plpgsql security definer set search_path = public as $$
+declare u profiles;
+begin
+  u := private.require_active();
+  if not private.can_read_post(p_post) or exists (select 1 from posts where id = p_post and deleted_at is not null) then raise exception '게시물을 찾을 수 없습니다.'; end if;
+  if exists (select 1 from post_reactions where post_id = p_post and member_id = u.id and kind = 'like') then
+    delete from post_reactions where post_id = p_post and member_id = u.id and kind = 'like';
+    return false;
+  end if;
+  insert into post_reactions (post_id, member_id, kind) values (p_post, u.id, 'like');
+  return true;
+end $$;
+
+create or replace function public.report_post(p_id uuid, p_reason text) returns void
+language plpgsql security definer set search_path = public as $$
+declare u profiles; p posts;
+begin
+  u := private.require_active();
+  if not private.can_read_post(p_id) then raise exception '게시물을 찾을 수 없습니다.'; end if;
+  select * into p from posts where id = p_id;
+  if p.deleted_at is not null then raise exception '삭제된 게시물입니다.'; end if;
+  if nullif(trim(p_reason), '') is null then raise exception '신고 사유를 입력하세요.'; end if;
+  perform private.check_len(trim(p_reason), 1000, '신고 사유');
+  if exists (select 1 from reports where post_id = p_id and reporter_id = u.id and status <> 'resolved') then
+    raise exception '이미 신고한 게시물입니다. 운영진이 확인 중입니다.';
+  end if;
+  insert into reports (post_id, reporter_id, reason) values (p_id, u.id, trim(p_reason));
+  perform private.notify_staff(format('게시물 「%s」에 대한 신고가 접수되었습니다.', p.title), '#/admin?tab=reports');
+end $$;
+
+-- ---------------------------------------------------------------------
+-- RLS: 2단계 표 (읽기만, 쓰기는 위 함수로만)
+-- ---------------------------------------------------------------------
+alter table public.team_projects         enable row level security;
+alter table public.team_members          enable row level security;
+alter table public.team_files            enable row level security;
+alter table public.team_file_versions    enable row level security;
+alter table public.team_notes            enable row level security;
+alter table public.team_credits          enable row level security;
+alter table public.team_credit_history   enable row level security;
+alter table public.team_project_sessions enable row level security;
+alter table public.team_final_files      enable row level security;
+alter table public.posts                 enable row level security;
+alter table public.post_sessions         enable row level security;
+alter table public.post_files            enable row level security;
+alter table public.post_comments         enable row level security;
+alter table public.post_reactions        enable row level security;
+
+-- 팀 이름·설명·상태·팀원 명단은 전체 부원이 볼 수 있고, 파일·메모는 팀원과 운영진만 (게시된 최종본은 전체 부원)
+drop policy if exists read_team_projects on public.team_projects;
+create policy read_team_projects on public.team_projects for select using (private.is_reader() and (deleted_at is null or private.is_staff()));
+drop policy if exists read_team_members on public.team_members;
+create policy read_team_members on public.team_members for select
+  using (private.is_reader() and (status = 'active' or member_id = private.my_member_id() or private.is_team_leader(team_id) or private.is_staff()));
+drop policy if exists read_team_files on public.team_files;
+create policy read_team_files on public.team_files for select using (private.can_view_team(team_id) or (private.is_reader() and private.file_has_public_final(id)));
+drop policy if exists read_team_file_versions on public.team_file_versions;
+create policy read_team_file_versions on public.team_file_versions for select
+  using (private.can_view_team(private.team_of_file(file_id)) or private.version_is_public_final(id));
+drop policy if exists read_team_notes on public.team_notes;
+create policy read_team_notes on public.team_notes for select using (private.can_view_team(team_id));
+drop policy if exists read_team_credits on public.team_credits;
+create policy read_team_credits on public.team_credits for select using (private.can_view_team(team_id) or (private.is_reader() and private.team_published(team_id)));
+drop policy if exists read_team_credit_history on public.team_credit_history;
+create policy read_team_credit_history on public.team_credit_history for select using (private.can_view_team(team_id));
+drop policy if exists read_team_project_sessions on public.team_project_sessions;
+create policy read_team_project_sessions on public.team_project_sessions for select using (private.is_reader());
+drop policy if exists read_team_final_files on public.team_final_files;
+create policy read_team_final_files on public.team_final_files for select using (private.can_view_team(team_id) or (private.is_reader() and private.team_published(team_id)));
+drop policy if exists read_posts on public.posts;
+create policy read_posts on public.posts for select using (private.can_read_post(id));
+drop policy if exists read_post_sessions on public.post_sessions;
+create policy read_post_sessions on public.post_sessions for select using (private.can_read_post(post_id));
+drop policy if exists read_post_files on public.post_files;
+create policy read_post_files on public.post_files for select using (private.can_read_post(post_id));
+drop policy if exists read_post_comments on public.post_comments;
+create policy read_post_comments on public.post_comments for select using (private.can_read_post(post_id) and (deleted_at is null or private.is_staff()));
+drop policy if exists read_post_reactions on public.post_reactions;
+create policy read_post_reactions on public.post_reactions for select using (private.can_read_post(post_id));
+
 
 -- ---------------------------------------------------------------------
 -- RLS: 읽기 정책만 둔다 (쓰기는 위 함수로만)
@@ -1665,6 +2727,10 @@ grant usage on schema private to anon, authenticated;
 revoke execute on all functions in schema private from public, anon, authenticated;
 grant execute on function private.my_member_id(), private.my_status(), private.is_reader(), private.is_staff(), private.is_admin(),
   private.is_owner(), private.has_role(text), private.has_perm(text), private.can_see(uuid), private.can_read_code(uuid) to anon, authenticated;
+-- [v2.1] 2단계 정책(Storage 포함)이 쓰는 판단 함수
+grant execute on function private.is_team_member(uuid), private.is_team_leader(uuid), private.can_view_team(uuid), private.team_published(uuid),
+  private.team_of_file(uuid), private.version_is_public_final(uuid), private.file_has_public_final(uuid), private.can_read_post(uuid),
+  private.can_read_path(text), private.can_upload_path(text) to anon, authenticated;
 
 revoke execute on all functions in schema public from public, anon;
 grant execute on all functions in schema public to authenticated;

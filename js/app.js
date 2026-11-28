@@ -39,7 +39,7 @@ function avatar(u, cls = '') {
   return html`<span class="avatar ${cls}" style="background:${avatarColor(u.id)}" aria-hidden="true">${(u.name || '?')[0]}</span>`;
 }
 function userChip(u) {
-  return html`<a class="user-chip" href="#/u/${u.id}">${avatar(u)}<span class="user-name">${u.name}</span>${u.status === 'graduated' ? html`<span class="badge badge-muted">졸업생</span>` : ''}</a>`;
+  return html`<a class="user-chip" href="#/member/${u.id}">${avatar(u)}<span class="user-name">${u.name}</span>${u.status === 'graduated' ? html`<span class="badge badge-muted">졸업생</span>` : ''}</a>`;
 }
 const roleText = (u) => (roleCodesOf(u).length ? roleCodesOf(u).map((c) => ROLE_LABEL[c]).join(' · ') : '부원');
 const roleBadge = (u) => (roleCodesOf(u).length ? roleCodesOf(u).map((c) => html`<span class="badge">${ROLE_LABEL[c]}</span> `) : html`<span class="badge badge-muted">부원</span>`);
@@ -112,6 +112,7 @@ function render() {
   const club = Api.settings().clubName;
   document.title = h1 && h1 !== club ? `${h1} · ${club}` : club;
   ui.after.forEach((fn) => { try { fn(); } catch (e) { console.error(e); } });
+  hydrateImages();
 }
 function route(parts, q, u) {
   const [a, b, c] = parts;
@@ -121,7 +122,11 @@ function route(parts, q, u) {
     case 'activity': return b ? (c ? viewSession(b, c, q) : viewYear(b)) : viewYears();
     case 'status': return viewStatus();
     case 'me': return viewActivity(u.id, q);
-    case 'u': return viewActivity(b, q);
+    case 'u': case 'member': return viewActivity(b, q);
+    case 'teams': return b === 'new' ? viewTeamNew() : viewTeams(q);
+    case 'team': return viewTeam(b, q);
+    case 'board': return b === 'new' ? viewPostEdit(null, q) : viewBoard(q);
+    case 'post': return c === 'edit' ? viewPostEdit(b, q) : viewPost(b);
     case 'new': return viewNew();
     case 'notifications': return viewNotifications();
     case 'admin': return viewAdmin(q);
@@ -143,9 +148,12 @@ function layout(u, body, section) {
   const unread = Api.unreadCount();
   const staff = Api.isStaff(u);
   const incoming = incomingTransfers(u);
-  const items = [['#/', '탐색', '', 'Compass'], ['#/activity', '활동', 'activity', 'CalendarDays'], ['#/archive', '기수 아카이브', 'archive', 'Layers'], ['#/me', '내 기여', 'me', 'User']];
+  // 상위 메뉴(기획서 §12): 홈(프로젝트) · 게시판 · 팀 프로젝트 · 활동 · 아카이브 · 관리. 내 기여는 [내 정보]로 계정 메뉴에 있다.
+  const items = [['#/', '홈', '', 'Compass'], ['#/board', '게시판', 'board', 'Newspaper'], ['#/teams', '팀 프로젝트', 'teams', 'Users'],
+    ['#/activity', '활동', 'activity', 'CalendarDays'], ['#/archive', '기수 아카이브', 'archive', 'Layers']];
   if (staff) items.push(['#/admin', '관리', 'admin', 'Settings']);
-  const isOn = (key) => section === key || (key === '' && section === 'p');
+  const SECTION_OF = { post: 'board', team: 'teams' };
+  const isOn = (key) => (SECTION_OF[section] || section) === key || (key === '' && section === 'p');
   return html`
   <button class="skip-link" data-act="skipToMain">본문으로 건너뛰기</button>
   <header class="topbar"><div class="topbar-in">
@@ -161,7 +169,7 @@ function layout(u, body, section) {
         <div class="dropdown-menu">
           <div class="menu-head"><b>${u.name}</b><span class="xs faint">${u.email}</span>
             <div class="row" style="margin-top:6px">${roleBadge(u)}${u.memberNo ? html`<span class="badge mono">${u.memberNo}</span>` : ''}${u.generation ? html`<span class="badge">${u.generation}기</span>` : ''}</div></div>
-          <a href="#/me">${icon('User', 15)}내 기여</a>
+          <a href="#/me">${icon('User', 15)}내 정보</a>
           <a href="#/notifications">${icon('Bell', 15)}알림</a>
           <hr>
           <button data-act="logout">${icon('LogOut', 15)}로그아웃</button>
@@ -173,6 +181,7 @@ function layout(u, body, section) {
   <nav class="mobile-nav" id="mobile-nav" aria-label="모바일 메뉴">
     ${items.map(([href, label, key, ic]) => html`<a href="${href}" class="${isOn(key) ? 'on' : ''}" ${isOn(key) ? raw('aria-current="page"') : ''}>${icon(ic, 18)}${label}</a>`)}
     ${u.status === 'active' ? html`<a href="#/new">${icon('Plus', 18)}새 프로젝트</a>` : ''}
+    <a href="#/me" class="${section === 'me' || section === 'member' || section === 'u' ? 'on' : ''}">${icon('User', 18)}내 정보</a>
     <a href="#/notifications">${icon('Bell', 18)}알림${unread ? html` <span class="counter counter-accent">${unread}</span>` : ''}</a>
   </nav>
   ${Remote.enabled && Remote.failed ? html`<div class="banner banner-warn" role="status">${icon('TriangleAlert', 15)}서버에서 최신 내용을 불러오지 못했습니다. 화면은 마지막으로 불러온 내용입니다. <a class="link" href="#/status">서버 상태 확인</a></div>` : ''}
@@ -253,6 +262,7 @@ function viewHome(q) {
   const canCreate = me.status === 'active';
   const scopes = [['', '전체'], ['roots', '원본'], ['mine', '내 프로젝트']];
   return html`
+  ${filtered ? '' : homeTop()}
   ${pageHeader('프로젝트', '', '', all.length)}
   <form class="toolbar" data-form="search" role="search">
     <label class="input-icon search-field"><span class="sr-only">검색</span>${icon('Search', 15)}<input type="search" name="q" value="${q.q || ''}" placeholder="제목, 설명, 작성자 검색" aria-keyshortcuts="/"><kbd class="kbd" aria-hidden="true">/</kbd></label>
@@ -945,9 +955,10 @@ function viewActivity(userId, q = {}) {
   const target = Api.user(userId);
   if (target.status === 'deleted') throw new Error('사용자를 찾을 수 없습니다.');
   const a = Api.activity(userId);
+  const p2 = Api.profile(userId);
   const mine = userId === me.id;
-  const tab = ['originals', 'forks', 'merged', 'contributed'].includes(q.tab) ? q.tab : 'originals';
-  const base = mine ? '#/me' : `#/u/${userId}`;
+  const tab = ['originals', 'forks', 'merged', 'contributed', 'teams', 'credits', 'posts'].includes(q.tab) ? q.tab : 'originals';
+  const base = mine ? '#/me' : `#/member/${userId}`;
   const projItem = (p) => html`<div class="item"><div class="item-main">
       <div class="item-title"><a href="#/p/${p.id}">${p.title}</a>${p.generation != null ? html`<span class="badge">${p.generation}기</span>` : ''}</div>
       <div class="item-sub">${p.parentId ? html`${icon('CornerDownRight', 13)} ${projTitle(Api.rawProject(p.parentId))}에서 이어짐` : html`이어진 수정본 ${Api.childrenOf(p.id).length}개`}${p.description ? html` · ${p.description}` : ''}</div>
@@ -961,15 +972,22 @@ function viewActivity(userId, q = {}) {
     contributed: [a.contributedTo, (p) => html`<div class="item"><div class="item-main">
         <div class="item-title"><a href="#/p/${p.id}">${p.title}</a></div>
         <div class="item-sub">${Api.user(p.ownerId).name} 님의 프로젝트</div></div></div>`, '기여자로 등록된 프로젝트가 없습니다.'],
+    teams: [p2.teams, (t) => html`<div class="item"><div class="item-main"><div class="item-title"><a href="#/team/${t.id}">${t.name}</a>${teamBadge(t)}<span class="badge">${t.year}년</span></div>
+        <div class="item-sub">${t.leader === userId ? '팀장' : '팀원'} · 팀장 ${Api.user(t.leader).name}</div></div></div>`, '참여 중인 팀 프로젝트가 없습니다.'],
+    credits: [p2.credits, ({ credit, team }) => html`<div class="item"><div class="item-main"><div class="item-title"><a href="#/team/${team.id}">${team.name}</a></div>
+        <div class="item-sub">제작자 표기: ${credit.displayName}${credit.contribution ? ' · ' + credit.contribution : ''}</div></div><div class="item-side">${team.year}년</div></div>`, '확정된 제작자 기록이 없습니다. 팀 프로젝트가 게시되면 기록됩니다.'],
+    posts: [p2.posts, (p) => html`<div class="item"><div class="item-main"><div class="item-title"><a href="#/post/${p.id}">${p.title}</a>${boardBadge(p)}</div>
+        <div class="item-sub">${p.year}년 · 좋아요 ${Api.likesOf(p.id)}</div></div><div class="item-side">${fmtDate(p.createdAt).slice(0, 10)}</div></div>`, '올린 게시물이 없습니다.'],
   };
   const [items, renderItem, none] = panes[tab];
-  const TABS2 = [['originals', '만든 원본', a.originals.length], ['forks', '만든 수정본', a.forks.length], ['merged', '반영된 요청', a.mergedRequests.length], ['contributed', '기여한 프로젝트', a.contributedTo.length]];
+  const TABS2 = [['originals', '만든 원본', a.originals.length], ['forks', '만든 수정본', a.forks.length], ['merged', '반영된 요청', a.mergedRequests.length], ['contributed', '기여한 프로젝트', a.contributedTo.length],
+    ['teams', '팀 프로젝트', p2.teams.length], ['credits', '제작자 기록', p2.credits.length], ['posts', '게시물', p2.posts.length]];
   return html`
   <header class="page-header">
     <div class="profile-head">${avatar(target, 'avatar-lg')}<div>
-      <div class="eyebrow" style="margin-bottom:2px">${mine ? '내 기여' : '기여 내역'}</div>
+      <div class="eyebrow" style="margin-bottom:2px">${mine ? '내 정보' : '회원 정보'}</div>
       <h1>${target.name}</h1>
-      <div class="meta" style="margin-top:4px">${mine || Api.isStaff(me) ? html`<span>${target.email}</span>` : ''}<span>${roleText(target)}</span>${target.memberNo ? html`<span class="mono">${target.memberNo}</span>` : ''}${target.generation ? html`<span>${target.generation}기</span>` : ''}${target.status !== 'active' ? html`<span>${STATUS_LABEL[target.status] || ''}</span>` : ''}</div>
+      <div class="meta" style="margin-top:4px">${mine || Api.isStaff(me) ? html`<span>${target.email}</span>` : ''}<span>현재 직책: ${roleText(target)}</span>${target.memberNo ? html`<span class="mono">${target.memberNo}</span>` : ''}${target.generation ? html`<span>${target.generation}기</span>` : ''}${target.status !== 'active' ? html`<span>${STATUS_LABEL[target.status] || ''}</span>` : ''}</div>
     </div></div>
     <div class="actions"><button class="btn" data-act="copyReport" data-id="${userId}">${icon('Copy', 15)}활동 보고서 복사</button></div>
   </header>
@@ -984,6 +1002,10 @@ function viewActivity(userId, q = {}) {
       ${items.length ? html`<div class="item-list">${items.map(renderItem)}</div>` : emptyInline(none)}
     </div>
     <aside>
+      <div class="aside-title">연도별 활동</div>
+      ${p2.history.length ? html`<div class="item-list" style="margin-bottom:20px">${p2.history.map((h) => html`<div class="item"><div class="item-main"><div class="item-title">${h.year}년</div>
+        <div class="item-sub">${[h.generation ? `${h.generation}기` : '', h.grade ? `${h.grade}학년` : '', (h.roles || []).length ? h.roles.map((c) => ROLE_LABEL[c] || c).join(' · ') : '부원'].filter(Boolean).join(' · ')}${h.status !== 'active' ? ` · ${STATUS_LABEL[h.status] || h.status}` : ''}</div></div></div>`)}</div>`
+        : emptyInline('연도별 명단 기록이 없습니다.')}
       <div class="aside-title">최근 활동</div>
       ${a.timeline.length ? html`<ol class="timeline">${a.timeline.map((e) => html`<li><span class="ticon">${icon(TL[e.type][0], 12)}</span>
         <div><div class="ttext">${TL[e.type][1](e)}</div><div class="twhen">${timeAgo(e.at)}</div></div></li>`)}</ol>`
@@ -1023,10 +1045,13 @@ const AUDIT_LABEL = {
   'settings.updated': '설정 변경', 'project.deleted': '프로젝트 삭제(운영진)', 'project.hidden': '프로젝트 숨김', 'project.unhidden': '프로젝트 숨김 해제',
   'report.resolved': '신고 처리', 'session.updated_past': '지난 연도 차시 수정', 'session.link_past': '지난 연도 차시 연결',
   'session.unlink_past': '지난 연도 차시 연결 해제', 'membership.updated_past': '지난 연도 명단 수정',
+  'team.past_edit': '지난 연도 팀 프로젝트 수정', 'team.status': '팀 상태 변경(운영진)', 'team.leader_changed': '팀장 변경(운영진)', 'team.published': '팀 프로젝트 게시',
+  'team.credits_edited': '게시 후 제작자 표시 수정', 'team.session_link_past': '팀 지난 연도 차시 연결', 'team.session_unlink_past': '팀 지난 연도 차시 연결 해제',
+  'post.deleted': '게시물 삭제(운영진)', 'post.hidden': '게시물 숨김', 'post.unhidden': '게시물 숨김 해제', 'post.comment_deleted': '댓글 삭제(운영진)',
 };
 const DETAIL_KEY = {
   role: '직책', email: '이메일', emails: '이메일', from: '이전', to: '변경', title: '제목', year: '연도', no: '차시', perm: '권한', enabled: '켬', count: '개수',
-  domain: '도메인', signup_mode: '가입 방식', club_name: '동아리 이름', max_file_kb: '파일 용량(KB)', whitelist_count: '명단 수', name: '이름',
+  domain: '도메인', signup_mode: '가입 방식', club_name: '동아리 이름', max_file_kb: '파일 용량(KB)', max_upload_mb: '업로드 용량(MB)', whitelist_count: '명단 수', name: '이름',
   from_name: '병합된 대기 회원', member_no: '회원 번호', generation: '기수', grade: '학년', action: '처리', reason: '사유',
 };
 function detailText(d) {
@@ -1117,7 +1142,7 @@ function viewAdmin(q) {
       : empty('아직 기록이 없습니다');
   } else if (tab === 'reports') {
     body = reports.length ? html`<div>${reports.map((r) => html`<div class="req"><div class="req-main">
-      <div class="req-line"><span class="badge ${REPORT[r.status][1]}">${REPORT[r.status][0]}</span>${projLink(Api.rawProject(r.projectId))}</div>
+      <div class="req-line"><span class="badge ${REPORT[r.status][1]}">${REPORT[r.status][0]}</span>${r.postId ? html`<span class="badge">게시물</span> <a class="link" href="#/post/${r.postId}">${Api.rawPost(r.postId)?.title || '(없음)'}</a>` : projLink(Api.rawProject(r.projectId))}</div>
       <div class="req-msg">${r.reason}</div>
       <div class="meta" style="margin-top:6px"><span>신고자 ${Api.user(r.reporterId).name}</span><span>${timeAgo(r.createdAt)}</span>${r.action ? html`<span>결과: ${r.action === 'hide' ? '숨김' : '문제없음'}</span>` : ''}</div></div>
       ${r.status !== 'resolved' && (r.status === 'open' || admin) ? html`<div class="row-end">
@@ -1140,6 +1165,7 @@ function viewAdmin(q) {
       </div></fieldset>
       <label class="field"><span>부원 이메일 명단</span><textarea name="whitelist" rows="5" placeholder="한 줄에 하나씩">${s.whitelist.join('\n')}</textarea><span class="hint">한 줄에 이메일 하나씩 적습니다.</span></label>
       <label class="field" style="max-width:320px"><span>파일당 용량 제한 (KB)</span><input name="maxFileKB" type="number" min="1" max="10240" value="${s.maxFileKB}"><span class="hint">1~10240KB(10MB). 프로젝트 하나의 전체 크기는 10MB까지입니다.</span></label>
+      <label class="field" style="max-width:320px"><span>팀·게시판 파일 업로드 제한 (MB)</span><input name="maxUploadMB" type="number" min="1" max="50" value="${s.maxUploadMB}" ${admin ? '' : raw('readonly')}><span class="hint">1~50MB. 팀 파일·게시물 첨부(Supabase Storage)에 적용됩니다. 실행 파일(${BLOCKED_EXT.join(', ')})은 올릴 수 없습니다.${admin ? '' : ' 관리자만 바꿀 수 있습니다.'}</span></label>
       <div class="form-footer" style="justify-content:flex-start"><button class="btn btn-primary">설정 저장</button></div></form>`;
   }
   return html`
@@ -1168,6 +1194,9 @@ function adminDashboard(u, users) {
     <span>활동 회원 <b class="num">${active}</b></span>
     <span>올해 프로젝트 <b class="num">${thisYear}</b></span>
     <span>전체 프로젝트 <b class="num">${all.length}</b></span>
+    <span>팀 프로젝트 <b class="num">${Api.counts2().teams}</b></span>
+    <span>게시물 <b class="num">${Api.counts2().posts}</b></span>
+    <span>팀 파일 버전 <b class="num">${Api.counts2().files}</b></span>
     ${unclassified != null ? html`<span>차시 미분류 <b class="num">${unclassified}</b></span>` : ''}
   </p>
   <div class="split">
@@ -1357,6 +1386,8 @@ function viewSession(yearStr, noStr, q) {
   const past = Api.isPastYear(year);
   const canEdit = me.status === 'active' && (past ? isAdmin(me) : isStaff(me));
   const all = Api.projectsOfSession(s.id);
+  const teamsHere = Api.teamsOfSession(s.id);
+  const postsHere = Api.postsOfSession(s.id);
   const authors = new Map();
   all.forEach((p) => creditsOf(p).all.forEach((a) => authors.set(a.id, a)));
   const kw = (q.q || '').trim().toLowerCase();
@@ -1382,12 +1413,19 @@ function viewSession(yearStr, noStr, q) {
     ${q.q || q.author ? html`<span class="result-count">${list.length}개 · <a class="link" href="${base}">초기화</a></span>` : ''}
   </form>
   ${list.length ? html`<div class="item-list">${list.map((p) => { const c = creditsOf(p); return html`<div class="item"><div class="item-main">
-      <div class="item-title"><a href="#/p/${p.id}">${p.title}</a>${typeBadge(p)}${p.generation != null ? html`<span class="badge">${p.generation}기</span>` : ''}</div>
+      <div class="item-title"><a href="#/p/${p.id}">${p.title}</a><span class="badge">${icon('FileCode', 12)}개인 코드 프로젝트</span>${typeBadge(p)}${p.generation != null ? html`<span class="badge">${p.generation}기</span>` : ''}</div>
       ${p.description ? html`<div class="item-sub">${p.description}</div>` : ''}
       <div class="item-sub">제작 <a class="link" href="#/u/${c.owner.id}">${c.owner.name}</a>${c.others.length ? html` · 기여 ${c.others.map((a, i) => html`${i ? ', ' : ''}<a class="link" href="#/u/${a.id}">${a.name}</a>`)}` : ''}</div>
     </div><div class="item-side">${fmtDate(p.createdAt).slice(0, 10)}</div></div>`; })}</div>`
     : all.length ? empty('조건에 맞는 결과물이 없습니다', '검색어나 제작자 필터를 바꿔 보세요.', html`<a class="btn btn-sm" href="${base}">필터 초기화</a>`)
-    : empty('이 차시에 연결된 결과물이 없습니다', '프로젝트 화면의 [차시] 탭에서 작성자나 운영진이 연결할 수 있습니다.')}`;
+    : teamsHere.length || postsHere.length ? ''
+    : empty('이 차시에 연결된 결과물이 없습니다', '프로젝트 화면의 [차시] 탭에서 작성자나 운영진이 연결할 수 있습니다.')}
+  ${teamsHere.length ? html`<section class="section"><div class="section-head"><h2>팀 프로젝트<span class="count">${teamsHere.length}</span></h2></div>
+    <div class="item-list">${teamsHere.map((t) => html`<div class="item"><div class="item-main"><div class="item-title"><a href="#/team/${t.id}">${t.name}</a><span class="badge">${icon('Users', 12)}팀 프로젝트</span>${teamBadge(t)}</div>
+      ${t.description ? html`<div class="item-sub">${t.description}</div>` : ''}<div class="item-sub">팀장 <a class="link" href="#/member/${t.leader}">${Api.user(t.leader).name}</a> · 팀원 ${Api.teamMembersOf(t.id).filter((m) => m.status === 'active').length}명</div></div>
+      <div class="item-side">${fmtDate(t.createdAt).slice(0, 10)}</div></div>`)}</div></section>` : ''}
+  ${postsHere.length ? html`<section class="section"><div class="section-head"><h2>동아리 게시물<span class="count">${postsHere.length}</span></h2></div>
+    <div class="post-list">${postsHere.map(postRow)}</div></section>` : ''}`;
 }
 /** 프로젝트 화면의 [차시] 탭: 이 프로젝트가 연결된 차시와, 연결·해제 */
 function tabSessions(p) {
@@ -1457,7 +1495,7 @@ function viewStatus() {
       <div class="table-wrap"><table class="tbl"><tbody>
         <tr><td>DB 크기</td><td class="num">${fmtSize(st.dbSize)} <span class="faint xs">(무료 요금제 500MB)</span></td></tr>
         <tr><td>현재 운영 연도</td><td class="num">${st.year}</td></tr>
-        ${Object.entries(st.counts).map(([k, v]) => html`<tr><td>${{ profiles: '회원', projects: '프로젝트', versions: '버전', comments: '댓글', notifications: '알림', sessions: '차시', audit_logs: '감사 기록' }[k] || k}</td><td class="num">${v}행</td></tr>`)}
+        ${Object.entries(st.counts).map(([k, v]) => html`<tr><td>${{ profiles: '회원', projects: '프로젝트', versions: '버전', comments: '댓글', notifications: '알림', sessions: '차시', audit_logs: '감사 기록', team_projects: '팀 프로젝트', posts: '게시물', team_file_versions: '팀 파일 버전' }[k] || k}</td><td class="num">${v}행</td></tr>`)}
       </tbody></table></div>
       <div class="section-head" style="margin-top:20px"><h3>최근 연결 확인</h3></div>
       ${st.pings.length ? html`<div class="item-list">${st.pings.map((x) => html`<div class="item"><div class="item-main">${fmtDate(x.at)}</div><div class="item-side">${x.ok ? '정상' : '실패'}</div></div>`)}</div>` : emptyInline('기록이 없습니다.')}
@@ -1478,6 +1516,436 @@ function renderBootFailure() {
       <h1>서버에 연결하지 못했습니다</h1>
       <p>${err}</p><p class="auth-foot">서버가 일시 정지되었을 수 있습니다. <a class="link" href="#/status">서버 상태 확인</a>에서 연결을 확인하고 안내를 따르세요. (js/config.js 의 Supabase 주소·키와 SETUP.md 의 설정도 확인하세요.)</p>
       <button class="btn" style="margin-top:16px" onclick="location.reload()">다시 시도</button></div></div></main>`).s;
+}
+
+/* ===================== 2단계: 파일 · 팀 프로젝트 · 게시판 ===================== */
+const TEAM_BADGE = { planning: 'badge-muted', active: 'badge-accent', pending_submit: 'badge-warn', done: 'badge-ok', published: 'badge-ok', archived: 'badge-muted' };
+const teamBadge = (t) => html`<span class="badge ${TEAM_BADGE[t.status]}">${TEAM_STATUS[t.status]}</span>`;
+const KIND_LABEL = { note: '메모', progress: '진행 상황', discussion: '토론' };
+const CREDIT_LABEL = { pending: '확인 대기', confirmed: '확인함', declined: '거절함' };
+const CREDIT_BADGE = { pending: 'badge-warn', confirmed: 'badge-ok', declined: 'badge-danger' };
+const RIGHTS_NOTICE = '제작자 표시는 기여 기록이며, 법적 저작권 귀속을 자동으로 결정하지 않습니다. 공개 범위와 권리에 대해 팀원과 합의하세요.';
+const BOARD_LABEL = { club: '동아리', free: '자유', notice: '공지' };
+const STEPS = ['planning', 'active', 'pending_submit', 'done', 'published'];
+function boardBadge(p) {
+  if (p.board === 'notice') return html`<span class="badge badge-accent">${icon('Megaphone', 12)}공지</span>`;
+  if (p.board === 'free') return html`<span class="badge badge-free" title="개인 창작물 · 동아리 공식 결과물과 구분됩니다">${icon('User', 12)}자유</span>`;
+  return html`<span class="badge badge-root">${icon('Newspaper', 12)}동아리</span>`;
+}
+const pastBadge = (year) => (year < Api.currentYear() ? html`<span class="badge badge-muted">지난 연도${isAdmin(Api.me()) ? '' : ' · 읽기 전용'}</span>` : '');
+
+/* ---------- 파일 올리기 (브라우저 → 저장소 → 서버에 등록) ---------- */
+function uploadHint() {
+  return html`파일당 최대 ${fmtSize(FileStore.limitBytes())} · 실행 파일(${BLOCKED_EXT.join(', ')})은 올릴 수 없습니다.${Remote.enabled ? '' : ' 데모 모드에서는 이 브라우저에 저장되므로 1MB까지만 올릴 수 있습니다.'}`;
+}
+function checkUploadFile(file) {
+  if (isBlockedName(file.name)) throw new Error(`「${file.name}」은(는) 실행 파일 형식이라 올릴 수 없습니다.`);
+  if (!file.size) throw new Error(`「${file.name}」은(는) 빈 파일입니다.`);
+  if (file.size > FileStore.limitBytes()) throw new Error(`「${file.name}」이(가) 용량 제한(${fmtSize(FileStore.limitBytes())})을 넘습니다.`);
+}
+/** 저장 경로에는 영문·숫자만 쓴다 (실제 파일 이름은 DB 에 따로 기록) */
+function asciiName(name) {
+  const m = String(name).match(/^(.*?)(\.[A-Za-z0-9]{1,10})?$/);
+  const base = (m[1] || '').replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^[._]+|[._]+$/g, '').slice(0, 60) || 'file';
+  return base + (m[2] || '');
+}
+const newFileId = () => (window.crypto?.randomUUID ? crypto.randomUUID() : uid('f'));
+/** 파일을 저장소에 올리고 경로를 돌려준다. 같은 경로에 덮어쓰지 않는다(경로마다 새 ID). */
+async function uploadFile(prefix, file) {
+  checkUploadFile(file);
+  const path = `${prefix}${newFileId()}-${asciiName(file.name)}`;
+  await FileStore.put(path, file);
+  return path;
+}
+/** 서명 주소가 필요한 이미지를 화면에 채운다 (대표 이미지 등) */
+function hydrateImages() {
+  document.querySelectorAll('img[data-path]').forEach((img) => {
+    const path = img.dataset.path; img.removeAttribute('data-path');
+    FileStore.url(path).then((u) => { img.src = u; img.hidden = false; }).catch(() => { img.closest('.cover')?.remove(); });
+  });
+}
+const fileRow = (path, name, size, extra = '') => html`<div class="item"><div class="item-main"><div class="item-title">${fileIcon(name)}${name}</div>
+  <div class="item-sub">${fmtSize(size)}${extra}</div></div>
+  <div class="item-side"><button class="btn btn-sm" data-act="downloadFile" data-path="${path}" data-name="${name}">${icon('Download', 14)}내려받기</button></div></div>`;
+
+/* ---------- 팀 프로젝트 목록 ---------- */
+function viewTeams(q) {
+  const u = Api.me();
+  const scope = q.scope === 'all' ? 'all' : 'mine';
+  const list = Api.teamList({ scope, status: q.status || '', year: q.year || '' });
+  const invites = Api.myInvites();
+  const years = [...new Set([...Api.years().map((y) => y.year), ...Api.teamList({}).map((t) => t.year)])].sort((a, b) => b - a);
+  const filtered = !!(q.status || q.year);
+  return html`
+  ${pageHeader('팀 프로젝트', '', u.status === 'active' ? html`<a class="btn btn-primary btn-sm" href="#/teams/new">${icon('Plus', 15)}새 팀 만들기</a>` : '', list.length)}
+  ${invites.length ? html`<section class="section" style="margin-top:0;margin-bottom:24px"><div class="section-head"><h2>받은 초대<span class="count">${invites.length}</span></h2></div>
+    <div class="item-list">${invites.map((t) => html`<div class="item"><div class="item-main"><div class="item-title"><a href="#/team/${t.id}">${t.name}</a></div>
+      <div class="item-sub">팀장 ${Api.user(t.leader).name} · ${t.year}년</div></div>
+      <div class="item-side row"><button class="btn btn-sm" data-act="respondInvite" data-id="${t.id}" data-v="0">거절</button><button class="btn btn-sm btn-primary" data-act="respondInvite" data-id="${t.id}" data-v="1">수락</button></div></div>`)}</div></section>` : ''}
+  <form class="toolbar" data-form="teamSearch" role="search">
+    <div class="segmented" role="radiogroup" aria-label="보기 범위">
+      ${[['mine', '내 팀'], ['all', '전체']].map(([v, label]) => html`<label><input type="radio" name="scope" value="${v}" data-change="submitForm" ${scope === v ? raw('checked') : ''}><span>${label}</span></label>`)}
+    </div>
+    <label><span class="sr-only">상태</span><select name="status" data-change="submitForm"><option value="">모든 상태</option>
+      ${Object.entries(TEAM_STATUS).map(([k, v]) => html`<option value="${k}" ${q.status === k ? raw('selected') : ''}>${v}</option>`)}</select></label>
+    <label><span class="sr-only">연도</span><select name="year" data-change="submitForm"><option value="">모든 연도</option>
+      ${years.map((y) => html`<option value="${y}" ${String(y) === q.year ? raw('selected') : ''}>${y}년</option>`)}</select></label>
+    ${filtered ? html`<span class="result-count">${list.length}개 · <a class="link" href="#/teams?scope=${scope}">초기화</a></span>` : ''}
+  </form>
+  ${list.length ? html`<div class="item-list">${list.map((t) => {
+    const members = Api.teamMembersOf(t.id).filter((m) => m.status === 'active');
+    return html`<div class="item"><div class="item-main">
+      <div class="item-title"><a href="#/team/${t.id}">${t.name}</a>${teamBadge(t)}<span class="badge">${t.year}년</span>${pastBadge(t.year)}</div>
+      ${t.description ? html`<div class="item-sub">${t.description}</div>` : ''}
+      <div class="item-sub">팀장 ${Api.user(t.leader).name} · 팀원 ${members.length}명</div></div>
+      <div class="item-side">${timeAgo(t.updatedAt)}</div></div>`;
+  })}</div>`
+    : scope === 'mine' && !filtered ? empty('참여 중인 팀이 없습니다', '새 팀을 만들거나, 초대를 받으면 여기에 나타납니다.', html`<a class="btn btn-sm" href="#/teams?scope=all">전체 팀 보기</a>`)
+    : empty('조건에 맞는 팀이 없습니다', '', html`<a class="btn btn-sm" href="#/teams?scope=${scope}">필터 초기화</a>`)}`;
+}
+function viewTeamNew() {
+  if (Api.me().status !== 'active') throw new Error('활동 중인 부원만 팀을 만들 수 있습니다.');
+  return html`
+  <div class="eyebrow"><a href="#/teams">팀 프로젝트</a>${icon('ChevronRight', 13)}<span>새 팀</span></div>
+  ${pageHeader('새 팀 만들기', '만든 사람이 팀장이 됩니다. 팀원은 만든 뒤에 초대합니다. 팀원은 초대를 수락해야 합류합니다.')}
+  <form data-form="teamNew" class="stack narrow">
+    <label class="field"><span>팀 이름</span><input name="name" required maxlength="60" placeholder="예: 로봇 청소기 팀"></label>
+    <label class="field"><span>설명</span><textarea name="description" rows="3" maxlength="2000" placeholder="어떤 팀인가요?"></textarea></label>
+    <label class="field"><span>목표</span><textarea name="goal" rows="2" maxlength="1000" placeholder="이번 연도에 만들고 싶은 결과물"></textarea></label>
+    <div class="form-footer"><a class="btn btn-tertiary" href="#/teams">취소</a><button class="btn btn-primary">${icon('Users', 15)}팀 만들기</button></div>
+  </form>`;
+}
+
+/* ---------- 팀 작업 공간 ---------- */
+function viewTeam(id, q) {
+  const t = Api.getTeam(id); const u = Api.me(); const ac = Api.teamAccess(t, u);
+  const mine = Api.teamMembersOf(id).find((m) => m.memberId === u.id);
+  const showFiles = ac.view || ac.published;
+  const T = [['overview', '개요', 'BookOpen'], ['files', '파일', 'Paperclip']];
+  if (ac.view) T.push(['notes', '메모·토론', 'MessageSquare'], ['progress', '진행 상황', 'Activity']);
+  if (ac.view || ac.published) T.push(['credits', '제작자', 'Users']);
+  if (ac.member || ac.staff) T.push(['settings', '설정', 'Settings2']);
+  const tab = T.some(([k]) => k === q.tab) ? q.tab : 'overview';
+  const body = { overview: teamOverview, files: teamFilesTab, notes: teamNotesTab, progress: teamNotesTab, credits: teamCreditsTab, settings: teamSettingsTab }[tab](t, ac, u, tab);
+  const pendingCredit = Api.teamCreditsOf(id).some((c) => c.memberId === u.id && c.status === 'pending');
+  const post = t.publishedAt ? Api.listPosts({}).find((p) => p.teamId === id) : null;
+  return html`
+  <div class="eyebrow"><a href="#/teams">팀 프로젝트</a>${icon('ChevronRight', 13)}<span>${t.name}</span></div>
+  <div class="proj-head"><div class="grow">
+    <h1><span class="t-text">${t.name}</span> ${teamBadge(t)}${pastBadge(t.year)}${t.deletedAt ? html`<span class="badge badge-danger">삭제됨</span>` : ''}</h1>
+    ${t.description ? html`<p class="desc">${t.description}</p>` : ''}
+    <div class="meta">${userChip(Api.user(t.leader))}<span>${t.year}년</span><span>${icon('Users', 13)}팀원 ${Api.teamMembersOf(id).filter((m) => m.status === 'active').length}명</span>
+      ${Api.sessionsOfTeam(id).map((s) => html`<span>${icon('CalendarDays', 13)}<a class="link" href="#/activity/${s.year}/${s.no}">${s.year} ${s.no}차시</a></span>`)}
+      ${post ? html`<span>${icon('Newspaper', 13)}<a class="link" href="#/post/${post.id}">게시물 보기</a></span>` : ''}</div>
+  </div></div>
+  ${ac.past && !ac.admin ? html`<div class="callout callout-warn" style="margin-bottom:16px">${icon('Lock')}<div>지난 연도의 팀 프로젝트입니다. 읽기 전용이며 관리자만 고칠 수 있습니다.</div></div>` : ac.past ? html`<div class="callout callout-warn" style="margin-bottom:16px">${icon('TriangleAlert')}<div>지난 연도의 팀 프로젝트입니다. 수정하면 감사 기록에 남습니다.</div></div>` : ''}
+  ${mine && mine.status === 'invited' ? html`<div class="callout callout-warn" style="margin-bottom:16px">${icon('Info')}<div>이 팀에 초대받았습니다. 수락하면 파일과 메모를 볼 수 있습니다.
+    <div class="row" style="margin-top:8px"><button class="btn btn-sm btn-primary" data-act="respondInvite" data-id="${id}" data-v="1">수락</button><button class="btn btn-sm" data-act="respondInvite" data-id="${id}" data-v="0">거절</button></div></div></div>` : ''}
+  ${pendingCredit && tab !== 'credits' ? html`<div class="callout callout-warn" style="margin-bottom:16px">${icon('Info')}<div>제작자 표시 확인을 요청받았습니다. <a class="inline-link" href="#/team/${id}?tab=credits">[제작자] 탭에서 확인 또는 거절</a>해 주세요.</div></div>` : ''}
+  <nav class="tabs" aria-label="팀 메뉴">${T.map(([k, label, ic]) => html`<a href="#/team/${id}${k === 'overview' ? '' : '?tab=' + k}" class="${k === tab ? 'on' : ''}" ${k === tab ? raw('aria-current="page"') : ''}>${icon(ic, 15)}${label}${k === 'credits' && pendingCredit ? html` <span class="counter counter-accent">1</span>` : ''}</a>`)}</nav>
+  <section>${body}</section>`;
+}
+function teamOverview(t, ac) {
+  const members = Api.teamMembersOf(t.id).filter((m) => m.status !== 'left');
+  const idx = STEPS.indexOf(t.status);
+  const finals = Api.teamFinalOf(t.id);
+  const files = Api.teamFilesOf(t.id);
+  return html`
+  <div class="split">
+    <div>
+      <section class="section"><div class="section-head"><h2>진행 단계</h2></div>
+        ${t.status === 'archived' ? html`<span class="badge badge-muted">보관됨</span>` : html`<ol class="steps">${STEPS.map((s, i) => html`<li class="${i < idx ? 'done' : i === idx ? 'now' : ''}" ${i === idx ? raw('aria-current="step"') : ''}>${TEAM_STATUS[s]}</li>`)}</ol>`}</section>
+      <section class="section"><div class="section-head"><h2>설명</h2></div>${t.description ? html`<p style="margin:0;white-space:pre-wrap">${t.description}</p>` : emptyInline('설명이 없습니다.')}</section>
+      <section class="section"><div class="section-head"><h2>목표</h2></div>${t.goal ? html`<p style="margin:0;white-space:pre-wrap">${t.goal}</p>` : emptyInline('목표가 없습니다.')}</section>
+      ${finals.length ? html`<section class="section"><div class="section-head"><h2>최종본<span class="count">${finals.length}</span></h2></div>
+        <div class="item-list">${files.flatMap((f) => f.versions.filter((v) => finals.includes(v.id)).map((v) => fileRow(v.path, v.origName || f.file.name, v.size, html` · ${f.file.name} v${v.versionNo}`)))}</div></section>` : ''}
+    </div>
+    <aside>
+      <div class="aside-title">팀원 ${members.filter((m) => m.status === 'active').length}명</div>
+      <div class="item-list">${members.map((m) => html`<div class="item"><div class="item-main"><div class="item-title">${userChip(Api.user(m.memberId))}</div>
+        <div class="item-sub">${m.memberId === t.leader ? '팀장' : m.roleLabel || '팀원'}${m.status === 'invited' ? ' · 초대 중' : ''}</div></div></div>`)}</div>
+      <div class="aside-title" style="margin-top:20px">연결된 차시</div>
+      ${Api.sessionsOfTeam(t.id).length ? html`<div class="item-list">${Api.sessionsOfTeam(t.id).map((s) => html`<div class="item"><div class="item-main"><a class="link" href="#/activity/${s.year}/${s.no}">${s.year}년 ${s.no}차시</a> <span class="muted">${s.title === `${s.no}차시` ? '' : s.title}</span></div></div>`)}</div>` : emptyInline('연결된 차시가 없습니다.')}
+    </aside>
+  </div>`;
+}
+function teamFilesTab(t, ac) {
+  const files = Api.teamFilesOf(t.id);
+  const finals = Api.teamFinalOf(t.id);
+  const canUpload = ac.canWork;
+  return html`
+  ${!ac.view ? html`<div class="callout" style="margin-bottom:16px">${icon('Lock')}<div>팀 파일은 팀원과 운영진만 볼 수 있습니다. 게시된 최종본만 전체 부원이 볼 수 있습니다.</div></div>` : ''}
+  ${canUpload ? html`<section class="section" style="margin-top:0"><div class="section-head"><h2>파일 올리기</h2></div>
+    <form data-form="teamUpload" data-id="${t.id}" class="stack narrow">
+      <label class="field"><span>파일</span><input type="file" name="file" required></label>
+      <label class="field"><span>올릴 곳</span><select name="fileId"><option value="">새 파일 (같은 이름이 이미 있으면 새 버전으로 쌓임)</option>
+        ${files.map((f) => html`<option value="${f.file.id}">「${f.file.name}」의 새 버전 (v${f.versions[0].versionNo + 1})</option>`)}</select></label>
+      <label class="field"><span>버전 메모 <span class="faint">(선택)</span></span><input name="note" maxlength="500" placeholder="무엇이 바뀌었나요?"></label>
+      <p class="faint xs" style="margin:0">${uploadHint()} 올린 파일은 덮어쓰지 않고 새 버전으로 쌓이며, 버전마다 올린 사람·날짜·메모가 남습니다.</p>
+      <div><button class="btn btn-primary">${icon('Upload', 15)}올리기</button></div>
+    </form></section>` : ''}
+  <section class="section" ${canUpload ? '' : raw('style="margin-top:0"')}><div class="section-head"><h2>파일<span class="count">${files.length}</span></h2></div>
+    ${files.length ? files.map((f) => html`<div class="panel" style="margin-bottom:12px"><div class="panel-head"><span class="title">${fileIcon(f.file.name)}${f.file.name}</span><span class="faint xs">${f.versions.length}개 버전</span></div>
+      <div class="item-list" style="border:0">${f.versions.map((v) => {
+        const isFinal = finals.includes(v.id);
+        return html`<div class="item"><div class="item-main">
+          <div class="item-title">v${v.versionNo}${isFinal ? html`<span class="badge badge-ok">${icon('Check', 12)}최종본</span>` : ''}<span class="muted small">${v.origName}</span></div>
+          <div class="item-sub">${fmtSize(v.size)} · ${Api.user(v.uploadedBy).name} · ${fmtDate(v.uploadedAt)}${v.note ? ' · ' + v.note : ''}</div></div>
+          <div class="item-side row"><button class="btn btn-sm" data-act="downloadFile" data-path="${v.path}" data-name="${v.origName || f.file.name}">${icon('Download', 14)}내려받기</button>
+            ${ac.leader && !ac.locked && ['planning', 'active'].includes(t.status) ? html`<button class="btn btn-sm btn-tertiary" data-act="setFinal" data-id="${t.id}" data-ver="${v.id}" data-v="${isFinal ? '0' : '1'}">${isFinal ? '최종본 해제' : '최종본으로 지정'}</button>` : ''}</div></div>`;
+      })}</div></div>`) : empty('아직 올린 파일이 없습니다', ac.view ? '위에서 첫 파일을 올려 보세요.' : '게시된 최종본이 없습니다.')}</section>`;
+}
+function teamNotesTab(t, ac, u, tab) {
+  const kinds = tab === 'progress' ? ['progress'] : ['note', 'discussion'];
+  const list = Api.teamNotesOf(t.id).filter((n) => kinds.includes(n.kind));
+  return html`
+  ${ac.canWork ? html`<form data-form="teamNote" data-id="${t.id}" class="stack narrow" style="margin-bottom:24px">
+    ${tab === 'progress' ? html`<input type="hidden" name="kind" value="progress">` : html`<label class="field" style="max-width:200px"><span>종류</span><select name="kind"><option value="discussion">토론</option><option value="note">메모</option></select></label>`}
+    <label class="field"><span>${tab === 'progress' ? '진행 상황 올리기' : '내용'}</span><textarea name="body" rows="3" maxlength="4000" required placeholder="${tab === 'progress' ? '오늘 한 일, 막힌 점 등' : '팀원에게 남길 말'}"></textarea></label>
+    <div><button class="btn btn-primary">${icon('MessageSquare', 15)}등록</button></div></form>` : ''}
+  ${list.length ? html`<div class="item-list">${list.map((n) => html`<div class="item ${n.pinned ? 'is-pinned' : ''}"><div class="item-main">
+    <div class="item-title">${userChip(Api.user(n.author))}<span class="badge">${KIND_LABEL[n.kind]}</span>${n.pinned ? html`<span class="badge badge-accent">${icon('Pin', 12)}고정</span>` : ''}<span class="faint xs">${timeAgo(n.createdAt)}</span></div>
+    <div class="note-body">${n.body}</div></div>
+    <div class="item-side row">${ac.leader && !ac.locked ? html`<button class="btn btn-sm btn-tertiary" data-act="pinNote" data-id="${n.id}" data-v="${n.pinned ? '0' : '1'}">${n.pinned ? '고정 해제' : '고정'}</button>` : ''}
+      ${(n.author === u.id || ac.leader) && !ac.locked ? html`<button class="btn btn-sm btn-tertiary" data-act="delNote" data-id="${n.id}">삭제</button>` : ''}</div></div>`)}</div>`
+    : emptyInline(tab === 'progress' ? '아직 올라온 진행 상황이 없습니다.' : '아직 메모나 토론이 없습니다.')}`;
+}
+function teamCreditsTab(t, ac, u) {
+  const credits = Api.teamCreditsOf(t.id);
+  const mine = credits.find((c) => c.memberId === u.id);
+  const preEdit = ac.leader && !ac.locked && !t.publishedAt && ['planning', 'active'].includes(t.status);
+  const adminEdit = ac.admin && !!t.publishedAt;
+  const editable = preEdit || adminEdit;
+  const people = Api.teamMembersOf(t.id).filter((m) => m.status === 'active' || (adminEdit && credits.some((c) => c.memberId === m.memberId)));
+  const hist = Api.teamCreditHistoryOf(t.id);
+  const HK = { added: '추가', changed: '수정', removed: '삭제', confirmed: '확인', declined: '거절' };
+  return html`
+  <div class="callout" style="margin-bottom:16px">${icon('Info')}<div>${RIGHTS_NOTICE}</div></div>
+  <p class="faint small" style="margin:0 0 12px">팀장이 제작자 명단(이름 표기·역할)을 작성하면 각 팀원이 본인 항목을 <b>확인 또는 거절</b>합니다. 전원이 확인해야 최종 제출할 수 있고, 게시하면 "제작자: …"로 표시됩니다.${t.publishedAt ? ' 게시된 뒤에는 관리자만 고칠 수 있고, 모든 변경은 이력과 감사 기록에 남습니다.' : ''}</p>
+  ${mine && mine.status === 'pending' ? html`<div class="callout callout-warn" style="margin-bottom:16px">${icon('Info')}<div><b>내 제작자 표시:</b> ${mine.displayName}${mine.contribution ? ' · ' + mine.contribution : ''}
+    <div class="row" style="margin-top:8px"><button class="btn btn-sm btn-primary" data-act="credit" data-id="${t.id}" data-v="1">${icon('Check', 14)}확인</button><button class="btn btn-sm" data-act="credit" data-id="${t.id}" data-v="0">거절</button></div></div></div>` : ''}
+  ${credits.length ? html`<div class="table-wrap"><table class="tbl"><thead><tr><th>제작자 표기</th><th>회원</th><th>역할·기여</th><th>상태</th></tr></thead><tbody>
+    ${credits.map((c) => html`<tr><td><b>${c.displayName}</b></td><td>${userChip(Api.user(c.memberId))}</td><td class="muted">${c.contribution || '—'}</td>
+      <td><span class="badge ${CREDIT_BADGE[c.status]}">${CREDIT_LABEL[c.status]}</span></td></tr>`)}</tbody></table></div>`
+    : emptyInline('아직 제작자 명단이 없습니다.')}
+  ${editable ? html`<section class="section"><div class="section-head"><h2>${adminEdit ? '제작자 표시 수정 (관리자)' : '제작자 명단 작성'}</h2></div>
+    <form data-form="teamCredits" data-id="${t.id}" class="stack">
+      <div class="table-wrap"><table class="tbl"><thead><tr><th style="width:48px">포함</th><th>회원</th><th>제작자 표기</th><th>역할·기여</th></tr></thead><tbody>
+        ${people.map((m) => { const c = credits.find((x) => x.memberId === m.memberId); const usr = Api.user(m.memberId); return html`<tr>
+          <td><label><span class="sr-only">${usr.name} 포함</span><input type="checkbox" name="inc_${m.memberId}" ${c || !credits.length ? raw('checked') : ''}></label></td>
+          <td>${usr.name}</td>
+          <td><label><span class="sr-only">${usr.name} 제작자 표기</span><input name="nm_${m.memberId}" value="${c ? c.displayName : usr.name}" maxlength="50"></label></td>
+          <td><label><span class="sr-only">${usr.name} 역할·기여</span><input name="ct_${m.memberId}" value="${c ? c.contribution : m.roleLabel === '팀장' ? '' : m.roleLabel}" maxlength="200" placeholder="예: 기획, 코드"></label></td></tr>`; })}
+      </tbody></table></div>
+      <p class="faint xs" style="margin:0">${adminEdit ? '수정한 항목은 바로 확정됩니다.' : '저장하면 새로 추가하거나 고친 항목은 해당 팀원의 확인을 다시 받습니다. 바뀌지 않은 항목은 확인 상태가 유지됩니다.'}</p>
+      <div><button class="btn btn-primary">${icon('Check', 15)}저장</button></div></form></section>` : ''}
+  ${hist.length ? html`<details class="section"><summary class="small muted" style="cursor:pointer;margin-bottom:8px">변경 이력 ${hist.length}건</summary>
+    <div class="item-list">${hist.map((h) => html`<div class="item"><div class="item-main"><div class="item-title">${HK[h.change.kind] || h.change.kind} · ${h.change.display_name || ''}</div>
+      <div class="item-sub">${h.actor ? Api.user(h.actor).name : '시스템'}${h.change.from_display_name ? ` · 이전: ${h.change.from_display_name}${h.change.from_contribution ? '(' + h.change.from_contribution + ')' : ''}` : ''}</div></div>
+      <div class="item-side">${fmtDate(h.at)}</div></div>`)}</div></details>` : ''}`;
+}
+function teamStatusButtons(t, ac) {
+  if (ac.locked) return '';
+  const btn = (to, label, cls = '') => html`<button class="btn ${cls}" data-act="teamStatus" data-id="${t.id}" data-to="${to}">${label}</button>`;
+  const out = [];
+  if (ac.leader && t.status === 'planning') out.push(btn('active', '진행 시작', 'btn-primary'));
+  if (ac.leader && t.status === 'active') out.push(btn('pending_submit', '최종 제출', 'btn-primary'));
+  if ((ac.leader || ac.staff) && t.status === 'pending_submit') out.push(btn('active', '제출 되돌리기'));
+  if (ac.staff && t.status === 'pending_submit') out.push(btn('done', '완료 처리', 'btn-primary'));
+  if (ac.staff && t.status === 'done') out.push(html`<button class="btn btn-primary" data-act="teamPublish" data-id="${t.id}">${icon('Newspaper', 15)}게시판에 게시</button>`, btn('active', '완료 되돌리기'));
+  if ((ac.leader || ac.staff) && t.status !== 'archived') out.push(btn('archived', '보관', 'btn-danger'));
+  return out;
+}
+function teamSettingsTab(t, ac, u) {
+  const members = Api.teamMembersOf(t.id).filter((m) => m.status !== 'left');
+  const taken = new Set(members.map((m) => m.memberId));
+  const candidates = Api.activeMembers().filter((x) => x.status === 'active' && !taken.has(x.id));
+  const cur = Api.currentYear();
+  const linked = new Set(Api.sessionsOfTeam(t.id).map((s) => s.id));
+  const canLink = (ac.leader || ac.staff) && !ac.locked;
+  const yearBlock = (y) => html`<div class="table-wrap" style="margin-bottom:12px"><table class="tbl"><thead><tr><th style="width:56px"></th><th>${y.year}년 차시</th><th>날짜</th></tr></thead><tbody>
+    ${Api.sessionsOf(y.year).map((s) => html`<tr><td><label><span class="sr-only">${y.year}년 ${s.no}차시에 연결</span><input type="checkbox" data-change="toggleTeamSession" data-tid="${t.id}" data-sid="${s.id}" ${linked.has(s.id) ? raw('checked') : ''} ${y.year === cur ? (canLink ? '' : raw('disabled')) : (canLink && ac.admin ? '' : raw('disabled'))}></label></td>
+      <td>${s.no}차시 <span class="muted">${s.title === `${s.no}차시` ? '' : s.title}</span></td><td class="muted small">${s.heldOn || '—'}</td></tr>`)}</tbody></table></div>`;
+  const buttons = teamStatusButtons(t, ac);
+  return html`
+  ${buttons.length ? html`<section class="section" style="margin-top:0"><div class="section-head"><h2>상태 변경</h2><span class="faint small">현재: ${TEAM_STATUS[t.status]}</span></div>
+    <div class="row">${buttons}</div>
+    <p class="faint xs" style="margin-top:8px">최종 제출에는 <b>최종본 파일 1개 이상</b>과 <b>전원이 확인한 제작자 명단</b>이 필요합니다. 운영진이 완료 처리한 뒤 게시하면 동아리 게시판에 올라가고 제작자 명단이 자동으로 붙습니다.</p></section>` : ''}
+  ${(ac.leader || ac.staff) && !ac.locked ? html`<section class="section"><div class="section-head"><h2>팀 정보</h2></div>
+    <form data-form="teamEdit" data-id="${t.id}" class="stack narrow">
+      <label class="field"><span>팀 이름</span><input name="name" value="${t.name}" required maxlength="60"></label>
+      <label class="field"><span>설명</span><textarea name="description" rows="3" maxlength="2000">${t.description}</textarea></label>
+      <label class="field"><span>목표</span><textarea name="goal" rows="2" maxlength="1000">${t.goal}</textarea></label>
+      <label class="field"><span>대표 이미지 <span class="faint">(선택${t.coverPath ? ', 올리면 바뀝니다' : ''})</span></span><input type="file" name="cover" accept="image/png,image/jpeg,image/gif,image/webp"></label>
+      <p class="faint xs" style="margin:0">${uploadHint()}</p>
+      <div><button class="btn btn-primary">저장</button></div></form></section>` : ''}
+  <section class="section"><div class="section-head"><h2>팀원<span class="count">${members.filter((m) => m.status === 'active').length}명</span></h2></div>
+    <div class="item-list">${members.map((m) => { const usr = Api.user(m.memberId); return html`<div class="item"><div class="item-main"><div class="item-title">${userChip(usr)}${m.memberId === t.leader ? html`<span class="badge badge-accent">팀장</span>` : ''}${m.status === 'invited' ? html`<span class="badge badge-warn">초대 중</span>` : ''}</div>
+      <div class="item-sub">${m.memberId === t.leader ? '' : m.roleLabel}</div></div>
+      <div class="item-side row">${(ac.leader || ac.staff) && !ac.locked && m.status === 'active' && m.memberId !== t.leader ? html`<button class="btn btn-sm btn-tertiary" data-act="makeLeader" data-id="${t.id}" data-member="${m.memberId}">팀장으로 지정</button>` : ''}
+        ${ac.leader && !ac.locked && m.memberId !== t.leader && !['published', 'archived'].includes(t.status) ? html`<button class="btn btn-sm btn-tertiary" data-act="removeMember" data-id="${t.id}" data-member="${m.memberId}">${m.status === 'invited' ? '초대 취소' : '내보내기'}</button>` : ''}</div></div>`; })}</div>
+    ${ac.leader && !ac.locked && !['published', 'archived'].includes(t.status) ? html`<form class="row" data-form="teamInvite" data-id="${t.id}" style="margin-top:12px">
+      <label><span class="sr-only">초대할 회원</span><select name="member" style="width:auto;min-width:200px"><option value="">초대할 회원 선택</option>${memberOptions(candidates)}</select></label>
+      <label><span class="sr-only">역할</span><input name="roleLabel" maxlength="30" placeholder="역할 (선택)" style="width:160px"></label>
+      <button class="btn btn-sm btn-primary">${icon('UserPlus', 14)}초대</button></form>` : ''}
+    ${ac.member && !ac.leader && !ac.locked ? html`<div style="margin-top:12px"><button class="btn btn-sm btn-danger" data-act="leaveTeam" data-id="${t.id}">팀 나가기</button></div>` : ''}
+    ${ac.leader ? html`<p class="faint xs" style="margin-top:8px">팀장은 팀을 떠날 수 없습니다. 다른 팀원을 [팀장으로 지정]한 뒤 나갈 수 있습니다.</p>` : ''}
+  </section>
+  <section class="section"><div class="section-head"><h2>연결된 차시</h2></div>
+    <p class="faint small" style="margin:-4px 0 8px">${canLink ? '체크하면 차시에 연결되고, 해제하면 연결이 끊어집니다. 여러 차시에 연결할 수 있습니다.' : '팀장 또는 운영진만 연결할 수 있습니다.'}</p>
+    ${Api.years().filter((y) => y.year === cur).map(yearBlock)}
+    ${ac.admin && Api.years().some((y) => y.year !== cur) ? html`<details class="section"><summary class="small muted" style="cursor:pointer;margin-bottom:8px">지난 연도 차시 (관리자만 · 감사 기록에 남음)</summary>${Api.years().filter((y) => y.year !== cur).map(yearBlock)}</details>` : ''}
+  </section>`;
+}
+
+/* ---------- 게시판 ---------- */
+function postRow(p) {
+  const a = Api.user(p.author);
+  const comments = Api.postCommentsOf(p.id).filter((c) => !c.deletedAt).length;
+  const likes = Api.likesOf(p.id);
+  const pinned = p.pinned && p.board === 'notice';
+  return html`<a class="post-row ${p.board === 'free' ? 'is-free' : ''} ${pinned ? 'is-pinned' : ''}" href="#/post/${p.id}">
+    <div class="post-main">
+      <div class="prow-title">${pinned ? icon('Pin', 14) : ''}<span class="t">${p.title}</span>${boardBadge(p)}${p.teamId ? html`<span class="badge">${icon('Users', 12)}팀 프로젝트</span>` : ''}
+        ${p.hidden ? html`<span class="badge badge-warn">${icon('EyeOff', 12)}숨김</span>` : ''}${p.visibility === 'staff' ? html`<span class="badge badge-muted">${icon('Lock', 12)}운영진만</span>` : ''}${p.deletedAt ? html`<span class="badge badge-danger">삭제됨</span>` : ''}</div>
+      <div class="meta"><span>${a.name}</span><span>${p.year}년</span><span>${timeAgo(p.createdAt)}</span>${p.tags.map((t) => html`<span class="tag">#${t}</span>`)}</div>
+    </div>
+    <div class="post-side faint xs"><span title="댓글">${icon('MessageSquare', 13)}${comments}</span><span title="좋아요">${icon('ThumbsUp', 13)}${likes}</span></div>
+  </a>`;
+}
+function viewBoard(q) {
+  const u = Api.me();
+  const board = ['club', 'free', 'notice'].includes(q.board) ? q.board : '';
+  const sort = q.sort === 'likes' ? 'likes' : 'new';
+  const list = Api.listPosts({ board, q: q.q || '', year: q.year || '', session: q.session || '', sort, tag: q.tag || '' });
+  const everything = Api.listPosts({});
+  const years = [...new Set([...Api.years().map((y) => y.year), ...everything.map((p) => p.year)])].sort((a, b) => b - a);
+  const sessions = Api.sessionsOf(q.year || Api.currentYear());
+  const filtered = !!(q.q || q.year || q.session || q.tag);
+  const tabs = [['', '전체'], ['club', '동아리'], ['free', '자유'], ['notice', '공지']];
+  const countOf = (b) => (b ? everything.filter((p) => p.board === b).length : everything.length);
+  const staff = Api.isStaff(u);
+  return html`
+  ${pageHeader('게시판', '', u.status === 'active' ? html`<a class="btn btn-primary btn-sm" href="#/board/new${staff ? '' : '?board=free'}">${icon('Pencil', 15)}글쓰기</a>` : '')}
+  <nav class="tabs" aria-label="게시판 종류">${tabs.map(([k, label]) => html`<a href="#/board${k ? '?board=' + k : ''}" class="${k === board ? 'on' : ''}" ${k === board ? raw('aria-current="page"') : ''}>${label}<span class="counter">${countOf(k)}</span></a>`)}</nav>
+  <form class="toolbar" data-form="boardSearch" data-board="${board}" role="search">
+    <label class="input-icon search-field"><span class="sr-only">게시물 검색</span>${icon('Search', 15)}<input type="search" name="q" value="${q.q || ''}" placeholder="제목, 태그, 작성자, 연도, 차시 검색"></label>
+    <label><span class="sr-only">연도</span><select name="year" data-change="submitForm"><option value="">모든 연도</option>${years.map((y) => html`<option value="${y}" ${String(y) === q.year ? raw('selected') : ''}>${y}년</option>`)}</select></label>
+    <label><span class="sr-only">차시</span><select name="session" data-change="submitForm"><option value="">모든 차시</option>${sessions.map((s) => html`<option value="${s.id}" ${s.id === q.session ? raw('selected') : ''}>${s.year} ${s.no}차시</option>`)}</select></label>
+    <div class="segmented" role="radiogroup" aria-label="정렬">${[['new', '최신'], ['likes', '반응순']].map(([v, label]) => html`<label><input type="radio" name="sort" value="${v}" data-change="submitForm" ${sort === v ? raw('checked') : ''}><span>${label}</span></label>`)}</div>
+    <button class="btn btn-tertiary search-btn">검색</button>
+    ${filtered ? html`<span class="result-count">${list.length}개 · <a class="link" href="#/board${board ? '?board=' + board : ''}">초기화</a></span>` : ''}
+  </form>
+  ${q.tag ? html`<p class="faint small" style="margin:-4px 0 12px">태그 <span class="tag">#${q.tag}</span> 게시물만 보는 중 · <a class="link" href="#/board${board ? '?board=' + board : ''}">해제</a></p>` : ''}
+  ${list.length ? html`<div class="post-list">${list.map(postRow)}</div>`
+    : empty(filtered ? '조건에 맞는 게시물이 없습니다' : '아직 게시물이 없습니다', filtered ? '검색어나 필터를 바꿔 보세요.' : '첫 글을 올려 보세요. 개인 창작물은 자유 게시판에 올릴 수 있습니다.')}`;
+}
+function viewPost(id) {
+  const p = Api.getPost(id); const u = Api.me();
+  const a = Api.user(p.author);
+  const staff = Api.isStaff(u); const mineP = p.author === u.id; const official = ['club', 'notice'].includes(p.board); const canEditP = mineP && (!official || staff); const active = u.status === 'active';
+  const files = Api.postFilesOf(id); const comments = Api.postCommentsOf(id);
+  const sessions = Api.sessionsOfPost(id);
+  const proj = p.projectId ? Api.rawProject(p.projectId) : null;
+  const t = p.teamId ? Api.getTeam(p.teamId) : null;
+  const credits = t ? Api.teamCreditsOf(t.id).filter((c) => c.status === 'confirmed') : [];
+  const finals = t ? Api.teamFilesOf(t.id).flatMap((f) => f.versions.filter((v) => Api.teamFinalOf(t.id).includes(v.id)).map((v) => ({ f: f.file, v }))) : [];
+  const liked = Api.postLikedByMe(id);
+  return html`
+  <div class="eyebrow"><a href="#/board">게시판</a>${icon('ChevronRight', 13)}<a href="#/board?board=${p.board}">${BOARD_LABEL[p.board]}</a></div>
+  <div class="proj-head"><div class="grow">
+    <h1><span class="t-text">${p.title}</span> ${boardBadge(p)}${p.hidden ? html`<span class="badge badge-warn">${icon('EyeOff', 12)}숨김 처리됨</span>` : ''}${p.visibility === 'staff' ? html`<span class="badge badge-muted">${icon('Lock', 12)}운영진만</span>` : ''}${p.deletedAt ? html`<span class="badge badge-danger">삭제됨 · 운영진에게만 보임</span>` : ''}</h1>
+    <div class="meta">${userChip(a)}<span>${fmtDate(p.createdAt)}</span><span>${p.year}년</span>${p.updatedAt !== p.createdAt ? html`<span class="faint">수정됨</span>` : ''}
+      ${sessions.map((s) => html`<span>${icon('CalendarDays', 13)}<a class="link" href="#/activity/${s.year}/${s.no}">${s.year} ${s.no}차시</a></span>`)}
+      ${p.tags.map((tg) => html`<a class="tag" href="#/board?tag=${encodeURIComponent(tg)}">#${tg}</a>`)}</div>
+  </div>
+  <div class="proj-actions">
+    ${active && !p.deletedAt ? html`<button class="btn ${liked ? 'btn-primary' : ''}" data-act="likePost" data-id="${id}" aria-pressed="${liked}">${icon('ThumbsUp', 15)}좋아요 ${Api.likesOf(id)}</button>` : html`<span class="faint small">${icon('ThumbsUp', 14)} ${Api.likesOf(id)}</span>`}
+    ${canEditP && active && !p.deletedAt ? html`<a class="btn" href="#/post/${id}/edit">${icon('Pencil', 15)}수정</a>` : ''}
+    <details class="dropdown more"><summary class="btn btn-icon" aria-label="더 보기">${icon('Ellipsis', 16)}</summary><div class="dropdown-menu">
+      ${staff && !p.deletedAt ? html`<button data-act="hidePost" data-id="${id}" data-v="${p.hidden ? '0' : '1'}">${icon(p.hidden ? 'Eye' : 'EyeOff', 15)}${p.hidden ? '숨김 해제' : '숨김 처리'}</button>` : ''}
+      ${staff && p.board === 'notice' && !p.deletedAt ? html`<button data-act="pinPost" data-id="${id}" data-v="${p.pinned ? '0' : '1'}">${icon('Pin', 15)}${p.pinned ? '고정 해제' : '상단 고정'}</button>` : ''}
+      ${!mineP && active && !p.deletedAt ? html`<button data-act="reportPost" data-id="${id}">${icon('Flag', 15)}신고</button>` : ''}
+      ${((mineP && !official) || staff) && active && !p.deletedAt ? html`<hr><button class="danger" data-act="delPost" data-id="${id}">${icon('Trash2', 15)}삭제</button>` : ''}
+      ${!active && !staff ? html`<div class="menu-head xs faint">읽기 전용 계정입니다</div>` : ''}
+    </div></details>
+  </div></div>
+  ${p.coverPath ? html`<div class="cover"><img data-path="${p.coverPath}" alt="" hidden></div>` : ''}
+  ${t ? html`<div class="credit-box"><div class="credit-line">${icon('Users', 15)}<b>제작자:</b> ${credits.length ? html`<span>${credits.map((c, i) => html`${i ? ', ' : ''}<a class="link" href="#/member/${c.memberId}">${c.displayName}</a>${c.contribution ? html` <span class="faint">(${c.contribution})</span>` : ''}`)}</span>` : html`<span class="faint">확정된 제작자가 없습니다</span>`}</div>
+    <div class="faint xs">팀 프로젝트 <a class="link" href="#/team/${t.id}">${t.name}</a> · ${RIGHTS_NOTICE}</div></div>` : ''}
+  ${proj ? html`<div class="callout" style="margin-bottom:16px">${icon('GitFork')}<div>연결된 코드 프로젝트: ${projLink(proj)}</div></div>` : ''}
+  <article class="md post-body">${p.body ? renderMarkdown(p.body) : html`<p class="faint">내용이 없습니다.</p>`}</article>
+  ${finals.length ? html`<section class="section"><div class="section-head"><h2>최종 결과물<span class="count">${finals.length}</span></h2></div><div class="item-list">${finals.map(({ f, v }) => fileRow(v.path, v.origName || f.name, v.size, html` · ${f.name} v${v.versionNo}`))}</div></section>` : ''}
+  ${files.length ? html`<section class="section"><div class="section-head"><h2>첨부<span class="count">${files.length}</span></h2></div><div class="item-list">${files.map((f) => fileRow(f.path, f.name, f.size))}</div></section>` : ''}
+  <section class="section"><div class="section-head"><h2>댓글<span class="count">${comments.filter((c) => !c.deletedAt).length}</span></h2></div>
+    ${comments.length ? html`<div class="item-list">${comments.map((c) => html`<div class="item"><div class="item-main">
+      <div class="item-title">${userChip(Api.user(c.author))}<span class="faint xs">${timeAgo(c.createdAt)}</span>${c.deletedAt ? html`<span class="badge badge-danger">삭제됨</span>` : ''}</div>
+      <div class="note-body ${c.deletedAt ? 'faint' : ''}">${c.body}</div></div>
+      <div class="item-side">${(c.author === u.id || staff) && active && !c.deletedAt ? html`<button class="btn btn-sm btn-tertiary" data-act="delPostComment" data-id="${c.id}">삭제</button>` : ''}</div></div>`)}</div>` : emptyInline('아직 댓글이 없습니다.')}
+    ${active && !p.deletedAt ? html`<form data-form="postComment" data-id="${id}" class="stack-sm" style="margin-top:12px">
+      <label class="field"><span class="sr-only">댓글</span><textarea name="body" rows="2" maxlength="2000" required placeholder="댓글을 남겨 주세요"></textarea></label>
+      <div><button class="btn btn-primary btn-sm">댓글 달기</button></div></form>` : ''}
+  </section>`;
+}
+function viewPostEdit(id, q) {
+  const u = Api.me();
+  if (u.status !== 'active') throw new Error('활동 중인 부원만 글을 쓸 수 있습니다.');
+  const staff = Api.isStaff(u);
+  const p = id ? Api.getPost(id) : null;
+  if (p && (p.author !== u.id || p.deletedAt)) throw new Error('작성자만 고칠 수 있습니다.');
+  const board = p ? p.board : (['club', 'free', 'notice'].includes(q.board) && (staff || q.board === 'free') ? q.board : staff ? 'club' : 'free');
+  const cur = Api.currentYear();
+  const sel = new Set(p ? Api.sessionsOfPost(id).map((s) => s.id) : []);
+  const myProjects = Api.listProjects({}).filter((x) => x.ownerId === u.id);
+  const teams = Api.teamList({}).filter((t) => t.status === 'published' && !Api.listPosts({}).some((x) => x.teamId === t.id));
+  const files = p ? Api.postFilesOf(id) : [];
+  return html`
+  <div class="eyebrow"><a href="#/board">게시판</a>${icon('ChevronRight', 13)}<span>${p ? '글 수정' : '글쓰기'}</span></div>
+  ${pageHeader(p ? '글 수정' : '글쓰기', '내용은 마크다운으로 쓸 수 있습니다.')}
+  <form data-form="post" data-id="${id || ''}" class="stack narrow" style="max-width:760px">
+    ${p ? '' : html`<fieldset><legend>게시판</legend><div class="segmented" role="radiogroup">${[['free', '자유 (개인 창작물)'], ...(staff ? [['club', '동아리 (공식 결과물)'], ['notice', '공지']] : [])].map(([v, label]) => html`<label><input type="radio" name="board" value="${v}" ${board === v ? raw('checked') : ''}><span>${label}</span></label>`)}</div>
+      <p class="faint xs" style="margin:6px 0 0">자유 게시판 글은 동아리 공식 결과물과 구분되어 표시됩니다.</p></fieldset>`}
+    <label class="field"><span>제목</span><input name="title" value="${p ? p.title : ''}" required maxlength="100"></label>
+    <label class="field"><span>내용 (마크다운)</span><textarea name="body" rows="12" maxlength="20000" class="ed-text" style="min-height:240px">${p ? p.body : ''}</textarea></label>
+    <label class="field"><span>태그 <span class="faint">(쉼표로 구분, 최대 8개)</span></span><input name="tags" value="${p ? p.tags.join(', ') : ''}" placeholder="예: 게임, 파이썬"></label>
+    <fieldset><legend>공개 범위</legend><div class="segmented" role="radiogroup">${[['members', '부원 전체'], ['staff', '운영진만']].map(([v, label]) => html`<label><input type="radio" name="visibility" value="${v}" ${(p ? p.visibility : 'members') === v ? raw('checked') : ''}><span>${label}</span></label>`)}</div></fieldset>
+    ${!p && board === 'notice' || staff && !p ? html`<label class="row" style="gap:6px"><input type="checkbox" name="pinned"><span class="small">공지로 올릴 때 상단에 고정</span></label>` : ''}
+    <fieldset><legend>연결 <span class="faint">(선택)</span></legend>
+      <div class="stack-sm">
+        <label class="field"><span>코드 프로젝트</span><select name="projectId"><option value="">연결 안 함</option>${myProjects.map((x) => html`<option value="${x.id}" ${p && p.projectId === x.id ? raw('selected') : ''}>${x.title}</option>`)}</select></label>
+        ${staff && !p ? html`<label class="field"><span>팀 프로젝트 (동아리 글, 게시 완료된 팀만)</span><select name="teamId"><option value="">연결 안 함</option>${teams.map((x) => html`<option value="${x.id}">${x.name}</option>`)}</select></label>` : ''}
+        <div class="field"><span>차시 (${cur}년)</span><div class="row">${Api.sessionsOf(cur).map((s) => html`<label class="row" style="gap:4px"><input type="checkbox" name="session" value="${s.id}" ${sel.has(s.id) ? raw('checked') : ''}><span class="small">${s.no}차시</span></label>`)}</div></div>
+      </div></fieldset>
+    <fieldset><legend>대표 이미지·첨부</legend>
+      <label class="field"><span>대표 이미지 <span class="faint">(선택${p && p.coverPath ? ', 올리면 바뀝니다' : ''})</span></span><input type="file" name="cover" accept="image/png,image/jpeg,image/gif,image/webp"></label>
+      <label class="field" style="margin-top:8px"><span>첨부 파일 <span class="faint">(최대 10개)</span></span><input type="file" name="files" multiple></label>
+      <p class="faint xs" style="margin:6px 0 0">${uploadHint()}</p>
+      ${files.length ? html`<div class="item-list" style="margin-top:8px">${files.map((f) => html`<div class="item"><div class="item-main"><div class="item-title">${fileIcon(f.name)}${f.name}</div><div class="item-sub">${fmtSize(f.size)}</div></div>
+        <div class="item-side"><button type="button" class="btn btn-sm btn-tertiary" data-act="removePostFile" data-id="${f.id}">빼기</button></div></div>`)}</div>` : ''}
+    </fieldset>
+    <div class="form-footer"><a class="btn btn-tertiary" href="${p ? '#/post/' + id : '#/board'}">취소</a><button class="btn btn-primary btn-lg">${p ? '저장' : '올리기'}</button></div>
+  </form>`;
+}
+
+/* ---------- 홈 상단: 고정 공지 · 이번 연도/차시 · 최근 게시물 ---------- */
+function homeTop() {
+  const y = Api.currentYear();
+  const sessions = Api.sessionsOf(y);
+  const today = new Date().toISOString().slice(0, 10);
+  const next = sessions.find((s) => s.heldOn && s.heldOn >= today) || [...sessions].reverse().find((s) => s.heldOn && s.heldOn < today) || null;
+  const notices = Api.listPosts({ board: 'notice' }).filter((p) => p.pinned).slice(0, 3);
+  const recent = Api.listPosts({}).filter((p) => p.board !== 'notice').slice(0, 4);
+  const myTeams = Api.teamList({ scope: 'mine' }).filter((t) => !['archived', 'published'].includes(t.status)).length;
+  return html`<section class="home-top">
+    ${notices.length ? html`<div class="home-block"><div class="section-head"><h2>${icon('Pin', 14)}공지</h2><a class="link small" href="#/board?board=notice">전체 보기</a></div>
+      <div class="post-list">${notices.map(postRow)}</div></div>` : ''}
+    <div class="home-grid">
+      <div class="home-block"><div class="section-head"><h2>${y}년 운영</h2><a class="link small" href="#/activity/${y}">차시 보기</a></div>
+        <p class="impact" style="margin:0"><span>차시 <b class="num">${sessions.length}</b></span><span>내 진행 중 팀 <b class="num">${myTeams}</b></span></p>
+        <p class="faint small" style="margin:8px 0 0">${next ? html`${next.heldOn >= today ? '다음' : '최근'} 차시: <a class="link" href="#/activity/${y}/${next.no}">${next.no}차시 ${next.title === `${next.no}차시` ? '' : next.title}</a> · ${next.heldOn}` : '날짜가 정해진 차시가 아직 없습니다.'}</p></div>
+      <div class="home-block"><div class="section-head"><h2>최근 게시물</h2><a class="link small" href="#/board">게시판</a></div>
+        ${recent.length ? html`<div class="post-list">${recent.map(postRow)}</div>` : emptyInline('아직 게시물이 없습니다.')}</div>
+    </div></section>`;
 }
 
 /* ===================== 이벤트 처리 ===================== */
@@ -1761,10 +2229,163 @@ const Forms = {
   async approveUser(f, fd) { await Api.approveUser(f.dataset.id, fd.get('generation')); render(); toast('승인했습니다.', 'ok'); },
   async settings(f, fd) {
     await Api.updateSettings({ clubName: fd.get('clubName'), domain: fd.get('domain'), signupMode: fd.get('signupMode'),
-      maxFileKB: fd.get('maxFileKB'), whitelist: String(fd.get('whitelist')).split(/\s+/) });
+      maxFileKB: fd.get('maxFileKB'), maxUploadMB: fd.get('maxUploadMB'), whitelist: String(fd.get('whitelist')).split(/\s+/) });
     render(); toast('설정을 저장했습니다.', 'ok');
   },
 };
+
+/* ---------- 2단계 이벤트 처리 (위의 Actions·Forms·Changes 에 더한다) ---------- */
+const pastConfirm = (t) => (t.year < Api.currentYear() ? '\n(지난 연도 팀이라 수정 내용이 감사 기록에 남습니다.)' : '');
+Object.assign(Actions, {
+  async respondInvite(el) {
+    const ok = el.dataset.v === '1';
+    await Api.respondTeamInvite(el.dataset.id, ok); render(); toast(ok ? '팀에 합류했습니다.' : '초대를 거절했습니다.', 'ok');
+  },
+  async teamStatus(el) {
+    const t = Api.getTeam(el.dataset.id); const to = el.dataset.to;
+    const msg = {
+      pending_submit: '최종 제출할까요?\n제출하면 최종본과 제작자 명단을 바꿀 수 없고, 운영진이 확인합니다.',
+      archived: `「${t.name}」을(를) 보관할까요?\n보관한 팀은 더 이상 고칠 수 없고 되돌릴 수 없습니다.`,
+      done: '완료 처리할까요? 이후 [게시판에 게시]로 올릴 수 있습니다.',
+      active: t.status === 'planning' ? '' : '제출(완료)을 되돌려 진행 중으로 바꿀까요?',
+    }[to];
+    if (msg && !confirm(msg + pastConfirm(t))) return;
+    await Api.setTeamStatus(t.id, to); render(); toast(`상태를 「${TEAM_STATUS[to]}」(으)로 바꿨습니다.`, 'ok');
+  },
+  async teamPublish(el) {
+    const t = Api.getTeam(el.dataset.id);
+    if (!confirm(`「${t.name}」을(를) 동아리 게시판에 게시할까요?\n확정된 제작자 명단이 자동으로 붙고, 최종본은 전체 부원이 볼 수 있게 됩니다.`)) return;
+    const p = await Api.publishTeam(t.id); toast('게시판에 게시했습니다.', 'ok'); go(`#/post/${p.id}`);
+  },
+  async leaveTeam(el) {
+    if (!confirm('이 팀에서 나갈까요?\n내 제작자 표시 항목이 있으면 함께 지워집니다.')) return;
+    await Api.leaveTeam(el.dataset.id); toast('팀에서 나왔습니다.', 'ok'); go('#/teams');
+  },
+  async removeMember(el) {
+    const m = Api.user(el.dataset.member);
+    if (!confirm(`${m.name} 님을 이 팀에서 ${Api.teamMembersOf(el.dataset.id).find((x) => x.memberId === m.id)?.status === 'invited' ? '초대 취소' : '내보낼'}까요?`)) return;
+    await Api.removeTeamMember(el.dataset.id, m.id); render(); toast('처리했습니다.', 'ok');
+  },
+  async makeLeader(el) {
+    const m = Api.user(el.dataset.member); const t = Api.getTeam(el.dataset.id);
+    if (!confirm(`${m.name} 님을 「${t.name}」의 새 팀장으로 지정할까요?${pastConfirm(t)}`)) return;
+    await Api.transferTeamLeader(t.id, m.id); render(); toast('팀장을 바꿨습니다.', 'ok');
+  },
+  async delNote(el) { if (!confirm('이 글을 삭제할까요?')) return; await Api.deleteTeamNote(el.dataset.id); render(); },
+  async pinNote(el) { await Api.pinTeamNote(el.dataset.id, el.dataset.v === '1'); render(); },
+  async setFinal(el) {
+    await Api.setTeamFinal(el.dataset.id, el.dataset.ver, el.dataset.v === '1'); render();
+    toast(el.dataset.v === '1' ? '최종본으로 지정했습니다. 같은 파일의 다른 버전은 해제됩니다.' : '최종본을 해제했습니다.', 'ok');
+  },
+  async credit(el) {
+    const ok = el.dataset.v === '1';
+    if (!confirm(ok ? '내 제작자 표시를 확인할까요?' : '내 제작자 표시를 거절할까요?\n팀장이 고친 뒤 다시 확인을 요청합니다.')) return;
+    await Api.respondTeamCredit(el.dataset.id, ok); render(); toast(ok ? '확인했습니다.' : '거절했습니다.', 'ok');
+  },
+  /** 파일 내려받기: 서버 모드에서는 60초 동안만 유효한 서명 주소를 새로 받아 연다 */
+  async downloadFile(el) {
+    const url = await FileStore.url(el.dataset.path, el.dataset.name);
+    const a = document.createElement('a');
+    a.href = url; a.download = el.dataset.name || ''; a.target = '_blank'; a.rel = 'noopener';
+    document.body.appendChild(a); a.click(); a.remove();
+  },
+  async likePost(el) { await Api.togglePostReaction(el.dataset.id); render(); },
+  async hidePost(el) { const on = el.dataset.v === '1'; await Api.setPostHidden(el.dataset.id, on); render(); toast(on ? '숨김 처리했습니다.' : '숨김을 해제했습니다.', 'ok'); },
+  async pinPost(el) { const on = el.dataset.v === '1'; await Api.setPostPinned(el.dataset.id, on); render(); toast(on ? '상단에 고정했습니다.' : '고정을 해제했습니다.', 'ok'); },
+  async delPost(el) {
+    const p = Api.getPost(el.dataset.id);
+    if (!confirm(`「${p.title}」을(를) 삭제할까요?${p.author !== Api.me().id ? '\n(운영진의 삭제는 감사 기록에 남습니다.)' : ''}`)) return;
+    await Api.deletePost(p.id); toast('삭제했습니다.', 'ok'); go('#/board');
+  },
+  async reportPost(el) {
+    const reason = prompt('신고 사유를 적어 주세요 (예: 부적절한 내용, 저작권 문제)'); if (reason == null) return;
+    await Api.reportPost(el.dataset.id, reason); toast('신고가 접수되었습니다. 운영진이 확인합니다.', 'ok');
+  },
+  async delPostComment(el) { if (confirm('댓글을 삭제할까요?')) { await Api.deletePostComment(el.dataset.id); render(); } },
+  async removePostFile(el) {
+    if (!confirm('이 첨부를 목록에서 뺄까요?\n(저장소의 파일 자체는 관리자만 지울 수 있습니다.)')) return;
+    await Api.removePostFile(el.dataset.id); el.closest('.item')?.remove();
+  },
+});
+Object.assign(Changes, {
+  async toggleTeamSession(el) {
+    try {
+      if (el.checked) await Api.linkTeamSession(el.dataset.tid, el.dataset.sid);
+      else await Api.unlinkTeamSession(el.dataset.tid, el.dataset.sid);
+    } catch (e) { el.checked = !el.checked; throw e; }
+    render(); toast(el.checked ? '차시에 연결했습니다.' : '차시 연결을 해제했습니다.', 'ok');
+  },
+});
+Object.assign(Forms, {
+  teamSearch(f, fd) {
+    const params = new URLSearchParams();
+    ['scope', 'status', 'year'].forEach((k) => { if (fd.get(k)) params.set(k, fd.get(k)); });
+    go('#/teams' + (params.toString() ? '?' + params : ''));
+  },
+  async teamNew(f, fd) {
+    const t = await Api.createTeam({ name: fd.get('name'), description: fd.get('description'), goal: fd.get('goal') });
+    toast('팀을 만들었습니다. 이제 팀원을 초대해 보세요.', 'ok'); go(`#/team/${t.id}?tab=settings`);
+  },
+  async teamEdit(f, fd) {
+    const id = f.dataset.id; const cover = fd.get('cover');
+    let coverPath;
+    if (cover && cover.size) coverPath = await uploadFile(`cover/team/${id}/`, cover);
+    await Api.updateTeam(id, { name: fd.get('name'), description: fd.get('description'), goal: fd.get('goal'), coverPath });
+    render(); toast('저장했습니다.', 'ok');
+  },
+  async teamInvite(f, fd) {
+    if (!fd.get('member')) throw new Error('초대할 회원을 고르세요.');
+    await Api.inviteTeamMember(f.dataset.id, fd.get('member'), fd.get('roleLabel')); render(); toast('초대했습니다. 상대방이 수락하면 팀원이 됩니다.', 'ok');
+  },
+  async teamUpload(f, fd) {
+    const file = fd.get('file');
+    if (!file || !file.size) throw new Error('올릴 파일을 고르세요.');
+    checkUploadFile(file);
+    const id = f.dataset.id;
+    const path = await uploadFile(`team/${id}/`, file);
+    const v = await Api.registerTeamFile(id, { path, name: file.name, note: fd.get('note'), fileId: fd.get('fileId') || null });
+    render(); toast(`올렸습니다.${v && v.versionNo ? ` (v${v.versionNo})` : ''}`, 'ok');
+  },
+  async teamNote(f, fd) { await Api.addTeamNote(f.dataset.id, fd.get('kind'), fd.get('body')); render(); toast('등록했습니다.', 'ok'); },
+  async teamCredits(f, fd) {
+    const list = [];
+    f.querySelectorAll('input[type=checkbox][name^="inc_"]').forEach((cb) => {
+      const mid = cb.name.slice(4);
+      if (cb.checked) list.push({ memberId: mid, displayName: fd.get('nm_' + mid), contribution: fd.get('ct_' + mid) });
+    });
+    const t = Api.getTeam(f.dataset.id);
+    if (t.publishedAt && !confirm('게시된 팀의 제작자 표시를 고칠까요?\n변경 이력과 감사 기록에 남습니다.')) return;
+    await Api.setTeamCredits(f.dataset.id, list); render(); toast(t.publishedAt ? '수정했습니다.' : '저장했습니다. 팀원에게 확인을 요청했습니다.', 'ok');
+  },
+  boardSearch(f, fd) {
+    const params = new URLSearchParams();
+    if (f.dataset.board) params.set('board', f.dataset.board);
+    ['q', 'year', 'session'].forEach((k) => { if (fd.get(k)) params.set(k, fd.get(k)); });
+    if (fd.get('sort') && fd.get('sort') !== 'new') params.set('sort', fd.get('sort'));
+    go('#/board' + (params.toString() ? '?' + params : ''));
+  },
+  async postComment(f, fd) { await Api.addPostComment(f.dataset.id, fd.get('body')); render(); toast('댓글을 남겼습니다.', 'ok'); },
+  async post(f, fd) {
+    const id = f.dataset.id || null;
+    const board = id ? Api.rawPost(id).board : fd.get('board');
+    const cur = Api.currentYear();
+    // 예전 연도 차시 연결은 화면에 보이지 않으므로 그대로 이어 둔다
+    const keep = id ? Api.sessionsOfPost(id).filter((s) => s.year !== cur).map((s) => s.id) : [];
+    const data = { board, title: fd.get('title'), body: fd.get('body'), tags: String(fd.get('tags') || '').split(','), visibility: fd.get('visibility'),
+      projectId: fd.get('projectId') || null, teamId: fd.get('teamId') || null, sessionIds: [...fd.getAll('session'), ...keep], pinned: board === 'notice' && !!fd.get('pinned') };
+    const cover = fd.get('cover'); const attach = fd.getAll('files').filter((x) => x && x.size);
+    [cover && cover.size ? cover : null, ...attach].filter(Boolean).forEach(checkUploadFile);   // 글을 저장하기 전에 파일부터 확인한다
+    let post;
+    if (id) { await Api.updatePost(id, data); post = Api.rawPost(id); } else post = await Api.createPost(data);
+    try {
+      if (cover && cover.size) await Api.registerPostFile(post.id, { path: await uploadFile(`post/${post.id}/`, cover), name: cover.name, cover: true });
+      for (const file of attach) await Api.registerPostFile(post.id, { path: await uploadFile(`post/${post.id}/`, file), name: file.name });
+    } catch (e) {
+      toast(`글은 저장되었지만 파일을 올리지 못했습니다: ${e.message}`, 'error'); go(`#/post/${post.id}/edit`); return;
+    }
+    toast(id ? '저장했습니다.' : '올렸습니다.', 'ok'); go(`#/post/${post.id}`);
+  },
+});
 
 document.addEventListener('click', (e) => {
   // 바깥을 누르면 열린 드롭다운을 닫는다
@@ -1836,7 +2457,8 @@ document.addEventListener('click', (e) => {
 });
 
 /** 편집 중인 화면은 다시 그리지 않는다 (입력 위치·스크롤 보존) */
-const isEditing = () => /^#\/(new|p\/[^/?]+\/edit)/.test(location.hash) || !!document.querySelector('.cmt-form');
+const isEditing = () => /^#\/(new|p\/[^/?]+\/edit|board\/new|post\/[^/?]+\/edit|teams\/new)/.test(location.hash) || !!document.querySelector('.cmt-form')
+  || /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || '') && !!document.activeElement.closest('#app');
 
 if (Remote.enabled) {
   // 다른 부원이 바꾼 내용을 반영: 창으로 돌아올 때와 1분마다 다시 읽는다
