@@ -284,7 +284,7 @@ const Remote = (() => {
         redirectTo: location.origin + location.pathname,
         // 학교 계정이 이미 로그인돼 있으면 그 세션을 그대로 쓰도록 강제 재선택(prompt)은 하지 않는다.
         // (학교 SSO(SAML) 도메인은 재인증을 강제하면 학교 로그인 서버에서 오류가 날 수 있음)
-        queryParams: { hd: Store.db.settings.domain },
+        queryParams: { hd: Store.db.settings.domain, prompt: 'select_account' },
       },
     });
     if (error) throw new ApiError(cleanError(error.message));
